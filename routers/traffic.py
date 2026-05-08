@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio
 import json
+import logging
 from datetime import datetime
 from typing import Optional
 
@@ -13,6 +14,7 @@ from database import get_db
 from services.traffic_service import get_dummy_traffic, get_traffic_data
 
 router = APIRouter(prefix="/traffic", tags=["Traffic"])
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -23,23 +25,60 @@ router = APIRouter(prefix="/traffic", tags=["Traffic"])
 @router.get("/", response_model=schemas.TrafficResponse, summary="Live traffic snapshot")
 async def get_traffic(
     origin: Optional[str] = Query(
-        None, description="Origin address/place name (enables Google Maps live data)"
+        None,
+        description="Origin address/place name (enables Google Maps live data)",
+        examples=["Hyderabad", "MG Road, Bangalore"],
     ),
     destination: Optional[str] = Query(
-        None, description="Destination address/place name (enables Google Maps live data)"
+        None,
+        description="Destination address/place name (enables Google Maps live data)",
+        examples=["Kamala", "Airport Road, Hyderabad"],
     ),
     db: Session = Depends(get_db),
 ):
     """
     Returns current traffic conditions.
 
-    - With **GOOGLE_MAPS_API_KEY** set **and** `origin`+`destination` provided →
-      fetches live data from Google Maps Distance Matrix API.
-    - Otherwise → returns randomised dummy data for 5 Indian city locations.
+    - With **GOOGLE_MAPS_DISTANCE_MATRIX_API_KEY** set and both `origin` + `destination` valid,
+      the endpoint attempts to fetch live traffic data from Google Maps Distance Matrix.
+    - If the API key is missing, the origin/destination values are invalid,
+      or the Google API call fails / returns no results,
+      the endpoint falls back to randomized dummy traffic data.
 
-    Every call persists the snapshot to PostgreSQL for historical queries.
+    Always returns HTTP 200 with traffic data, and never fails with a 500 due
+    to external Google API issues.
     """
-    traffic_list, source = await get_traffic_data(origin, destination)
+    origin_value = origin.strip() if origin else None
+    destination_value = destination.strip() if destination else None
+
+    use_google = bool(origin_value and destination_value)
+    if use_google and (len(origin_value) < 2 or len(destination_value) < 2):
+        logger.warning(
+            "Invalid traffic query values, falling back to dummy data: origin=%r destination=%r",
+            origin_value,
+            destination_value,
+        )
+        use_google = False
+
+    if use_google:
+        try:
+            traffic_list, source = await get_traffic_data(origin_value, destination_value)
+            if not traffic_list or source != "google_maps":
+                logger.warning(
+                    "Google Maps returned no live results for origin=%r destination=%r; using dummy data",
+                    origin_value,
+                    destination_value,
+                )
+                traffic_list, source = get_dummy_traffic(), "dummy"
+        except Exception as exc:
+            logger.error(
+                "Google Maps traffic API error, falling back to dummy data: %s",
+                exc,
+                exc_info=True,
+            )
+            traffic_list, source = get_dummy_traffic(), "dummy"
+    else:
+        traffic_list, source = get_dummy_traffic(), "dummy"
 
     for item in traffic_list:
         record = models.TrafficRecord(
@@ -51,7 +90,11 @@ async def get_traffic(
             travel_time_mins=item["travel_time_mins"],
         )
         db.add(record)
-    db.commit()
+    try:
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.error("Failed to persist traffic snapshot, continuing with response: %s", exc, exc_info=True)
 
     return schemas.TrafficResponse(
         status="ok",
@@ -77,8 +120,18 @@ async def get_dummy():
     summary="Stored traffic history",
 )
 async def get_history(
-    limit: int = Query(50, ge=1, le=500, description="Max records to return"),
-    location: Optional[str] = Query(None, description="Filter by location name (partial match)"),
+    limit: int = Query(
+        50,
+        ge=1,
+        le=500,
+        description="Max records to return",
+        examples=[50],
+    ),
+    location: Optional[str] = Query(
+        None,
+        description="Filter by location name (partial match)",
+        examples=["Hyderabad"],
+    ),
     db: Session = Depends(get_db),
 ):
     """Reads stored traffic records from PostgreSQL, newest first."""

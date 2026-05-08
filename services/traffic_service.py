@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio
 import json
+import logging
 import os
 import random
 from datetime import datetime
@@ -11,8 +12,11 @@ from urllib.request import urlopen
 from dotenv import load_dotenv
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 
-GOOGLE_MAPS_API_KEY: str = os.getenv("GOOGLE_MAPS_API_KEY", "")
+GOOGLE_MAPS_API_KEY: str = os.getenv("GOOGLE_MAPS_DISTANCE_MATRIX_API_KEY", "")
+print("DEBUG: GOOGLE_MAPS_DISTANCE_MATRIX_API_KEY =", repr(GOOGLE_MAPS_API_KEY))
+
 
 # Sample Indian city locations used for dummy / fallback data
 _SAMPLE_LOCATIONS = [
@@ -81,14 +85,31 @@ async def _fetch_google_maps(origin: str, destination: str) -> dict | None:
         return None
 
     if data.get("status") != "OK":
+        logger.warning(
+            "Distance Matrix API returned status=%s for origin=%r destination=%r",
+            data.get("status"),
+            origin,
+            destination,
+        )
         return None
 
     try:
         element = data["rows"][0]["elements"][0]
     except (KeyError, IndexError):
+        logger.warning(
+            "Distance Matrix API returned malformed rows/elements for origin=%r destination=%r",
+            origin,
+            destination,
+        )
         return None
 
     if element.get("status") != "OK":
+        logger.warning(
+            "Distance Matrix element returned status=%s for origin=%r destination=%r",
+            element.get("status"),
+            origin,
+            destination,
+        )
         return None
 
     duration_s: int = element["duration"]["value"]

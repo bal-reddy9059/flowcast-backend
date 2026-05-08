@@ -10,6 +10,10 @@ import os
 from datetime import datetime
 from typing import List, Tuple
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import httpx
 from fastapi import HTTPException, status
 from sqlalchemy import select
@@ -20,7 +24,7 @@ from app.schemas.route import RouteSegment
 
 logger = logging.getLogger(__name__)
 
-GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_DIRECTIONS_API_KEY")
 
 
 async def get_route_from_google(
@@ -258,44 +262,6 @@ def build_google_maps_url(
     """
     return (
         f"https://www.google.com/maps/dir/?api=1"
-        f"&origin={origin_lat},{origin_lng}"
-        f"&destination={dest_lat},{dest_lng}"
-        f"&travelmode={mode}"
-    )
-
-    def query() -> List[Incident]:
-        return (
-            db.query(Incident)
-            .filter(
-                Incident.latitude.between(min_lat, max_lat),
-                Incident.longitude.between(min_lng, max_lng),
-                Incident.resolved_at.is_(None),
-                Incident.is_active.is_(True),
-            )
-            .all()
-        )
-
-    incidents = await asyncio.to_thread(query)
-    warnings: List[str] = []
-
-    for incident in incidents:
-        warnings.append(
-            f"{incident.incident_type.title()} near {incident.location} — Severity: {incident.severity}"
-        )
-
-    return warnings
-
-
-async def build_google_maps_url(
-    origin_lat: float,
-    origin_lng: float,
-    dest_lat: float,
-    dest_lng: float,
-    mode: str,
-) -> str:
-    """Build a Google Maps directions deep link for the requested route."""
-    return (
-        "https://www.google.com/maps/dir/?api=1"
         f"&origin={origin_lat},{origin_lng}"
         f"&destination={dest_lat},{dest_lng}"
         f"&travelmode={mode}"
