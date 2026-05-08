@@ -5,6 +5,8 @@ from database import engine
 import models
 from routers import traffic
 from app.routes.heatmap import router as heatmap_router
+from app.routes.route import router as route_router
+from app.models.route import SavedRoute
 
 
 @asynccontextmanager
@@ -29,6 +31,7 @@ app.add_middleware(
 
 app.include_router(traffic.router)
 app.include_router(heatmap_router)
+app.include_router(route_router)
 
 
 @app.get("/", tags=["Root"])

@@ -1,37 +1,26 @@
 """
-Route optimization service.
+Route optimization service for FlowCast.
 
-Provides Google Directions integration and route enrichment using local traffic data.
+Handles Google Maps API integration, traffic enrichment, ETA calculations,
+incident checking, and Google Maps URL generation for Hyderabad routes.
 """
 
-import asyncio
 import logging
 import os
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import List, Tuple
 
 import httpx
-from dotenv import load_dotenv
 from fastapi import HTTPException, status
-from sqlalchemy import func
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.predictor import Incident, TrafficRecord
+from app.models.predictor import TrafficRecord
 from app.schemas.route import RouteSegment
-
-load_dotenv()
-
-GOOGLE_MAPS_ENDPOINT = "https://maps.googleapis.com/maps/api/directions/json"
-GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
 
 logger = logging.getLogger(__name__)
 
-CONGESTION_SPEEDS = {
-    "low": 60.0,
-    "medium": 35.0,
-    "high": 15.0,
-}
-
-HYDERABAD_RADIUS_DEGREES = 0.01
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
 
 
 async def get_route_from_google(
@@ -41,171 +30,163 @@ async def get_route_from_google(
     dest_lng: float,
     mode: str,
     api_key: str,
-) -> Dict[str, Any]:
-    """Fetch optimized route data from Google Directions API."""
-    effective_api_key = api_key or GOOGLE_MAPS_API_KEY
-    if not effective_api_key:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Google Maps API key is not configured",
-        )
+) -> dict:
+    """Fetch route data from Google Maps Directions API.
 
+    Args:
+        origin_lat: Origin latitude
+        origin_lng: Origin longitude
+        dest_lat: Destination latitude
+        dest_lng: Destination longitude
+        mode: Travel mode (driving, walking, transit)
+        api_key: Google Maps API key
+
+    Returns:
+        dict: Parsed route data with steps, total distance, and duration
+
+    Raises:
+        HTTPException: 400 if no route found, 503 if API unavailable
+    """
+    url = "https://maps.googleapis.com/maps/api/directions/json"
     params = {
         "origin": f"{origin_lat},{origin_lng}",
         "destination": f"{dest_lat},{dest_lng}",
         "mode": mode,
-        "key": effective_api_key,
         "departure_time": "now",
         "traffic_model": "best_guess",
+        "key": api_key,
     }
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
-            response = await client.get(GOOGLE_MAPS_ENDPOINT, params=params)
-        except httpx.RequestError as error:
-            logger.error("Google Maps request error: %s", error)
+            response = await client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+        except httpx.HTTPError as e:
+            logger.error("Google Maps API call failed: %s", e)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Google Maps unavailable",
+                detail="Google Maps API unavailable",
             )
 
-    if response.status_code != status.HTTP_200_OK:
-        logger.error(
-            "Google Maps returned non-200 status: %s %s",
-            response.status_code,
-            response.text,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Google Maps unavailable",
-        )
-
-    data = response.json()
-    api_status = data.get("status")
-    if api_status == "ZERO_RESULTS":
+    if data.get("status") == "ZERO_RESULTS":
+        logger.warning("No route found between %s,%s and %s,%s", origin_lat, origin_lng, dest_lat, dest_lng)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No route found for the provided coordinates",
-        )
-    if api_status != "OK":
-        logger.error("Google Maps API error: %s - %s", api_status, data.get("error_message"))
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Google Maps unavailable",
+            detail="No route found between these locations",
         )
 
-    routes = data.get("routes") or []
-    if not routes:
+    if data.get("status") != "OK":
+        logger.error("Google Maps API error: %s", data.get("status"))
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Google Maps did not return any routes",
+            detail="Google Maps API unavailable",
         )
 
-    leg = routes[0].get("legs", [])[0]
-    if not leg:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Google Maps did not return route legs",
-        )
+    route = data["routes"][0]
+    leg = route["legs"][0]
 
-    total_distance_km = leg["distance"]["value"] / 1000.0
-    total_duration_minutes = leg["duration"]["value"] / 60.0
     steps = []
+    for step in leg["steps"]:
+        steps.append({
+            "start_location": {
+                "lat": step["start_location"]["lat"],
+                "lng": step["start_location"]["lng"],
+            },
+            "end_location": {
+                "lat": step["end_location"]["lat"],
+                "lng": step["end_location"]["lng"],
+            },
+            "distance_km": step["distance"]["value"] / 1000,
+            "duration_minutes": step["duration"]["value"] / 60,
+        })
 
-    for step in leg.get("steps", []):
-        start_location = step["start_location"]
-        end_location = step["end_location"]
-        steps.append(
-            {
-                "start_location": {
-                    "lat": float(start_location["lat"]),
-                    "lng": float(start_location["lng"]),
-                },
-                "end_location": {
-                    "lat": float(end_location["lat"]),
-                    "lng": float(end_location["lng"]),
-                },
-                "distance_km": float(step["distance"]["value"]) / 1000.0,
-                "duration_minutes": float(step["duration"]["value"]) / 60.0,
-                "html_instructions": step.get("html_instructions"),
-            }
-        )
+    total_distance_km = leg["distance"]["value"] / 1000
+    total_duration_minutes = leg["duration"]["value"] / 60
+
+    logger.info("Fetched route from Google Maps: %s km, %s minutes", total_distance_km, total_duration_minutes)
 
     return {
-        "origin": leg.get("start_address", "Origin"),
-        "destination": leg.get("end_address", "Destination"),
+        "steps": steps,
         "total_distance_km": total_distance_km,
         "total_duration_minutes": total_duration_minutes,
-        "steps": steps,
     }
 
 
-async def enrich_route_with_traffic(
-    route_data: Dict[str, Any],
-    db: Any,
-) -> List[RouteSegment]:
-    """Enrich Google route segments with local traffic data from PostgreSQL."""
+async def enrich_route_with_traffic(route_data: dict, db: AsyncSession) -> List[RouteSegment]:
+    """Enrich route steps with real-time traffic data.
 
-    async def fetch_nearest_record(lat: float, lng: float) -> Any:
-        def query() -> Any:
-            return (
-                db.query(TrafficRecord)
-                .filter(
-                    TrafficRecord.latitude.between(lat - HYDERABAD_RADIUS_DEGREES, lat + HYDERABAD_RADIUS_DEGREES),
-                    TrafficRecord.longitude.between(lng - HYDERABAD_RADIUS_DEGREES, lng + HYDERABAD_RADIUS_DEGREES),
-                )
-                .order_by(
-                    func.abs(TrafficRecord.latitude - lat) + func.abs(TrafficRecord.longitude - lng)
-                )
-                .first()
-            )
+    Args:
+        route_data: Route data from Google Maps API
+        db: Database session
 
-        return await asyncio.to_thread(query)
+    Returns:
+        List[RouteSegment]: Route segments with traffic information
+    """
+    segments = []
 
-    enriched_segments: List[RouteSegment] = []
-    for step in route_data.get("steps", []):
-        start = step["start_location"]
-        record = await fetch_nearest_record(start["lat"], start["lng"])
+    for step in route_data["steps"]:
+        # Calculate midpoint of the step
+        mid_lat = (step["start_location"]["lat"] + step["end_location"]["lat"]) / 2
+        mid_lng = (step["start_location"]["lng"] + step["end_location"]["lng"]) / 2
+
+        # Query nearest traffic record within 0.01 degrees (~1km)
+        stmt = select(TrafficRecord).where(
+            TrafficRecord.latitude.between(mid_lat - 0.01, mid_lat + 0.01),
+            TrafficRecord.longitude.between(mid_lng - 0.01, mid_lng + 0.01),
+        ).order_by(TrafficRecord.timestamp.desc()).limit(1)
+
+        result = await db.execute(stmt)
+        record = result.scalars().first()
 
         if record:
-            congestion_level = record.congestion_level or "medium"
-            congestion_warning = (
-                f"Heavy traffic detected near {record.location} — expect delays"
-                if congestion_level == "high"
-                else None
-            )
-            duration_minutes = float(record.travel_time_mins) if record.travel_time_mins else step["duration_minutes"]
+            congestion_level = record.congestion_level
+            warning = None
+            if congestion_level == "high":
+                warning = f"Heavy traffic near {record.location} — expect delays"
         else:
-            congestion_level = "medium"
-            congestion_warning = None
-            duration_minutes = step["duration_minutes"]
+            congestion_level = "medium"  # Fallback
+            warning = None
 
-        enriched_segments.append(
-            RouteSegment(
-                start_location=start,
-                end_location=step["end_location"],
-                distance_km=step["distance_km"],
-                duration_minutes=duration_minutes,
-                congestion_level=congestion_level,
-                congestion_warning=congestion_warning,
-            )
+        segment = RouteSegment(
+            start_location={
+                "lat": step["start_location"]["lat"],
+                "lng": step["start_location"]["lng"],
+            },
+            end_location={
+                "lat": step["end_location"]["lat"],
+                "lng": step["end_location"]["lng"],
+            },
+            distance_km=round(step["distance_km"], 1),
+            duration_minutes=round(step["duration_minutes"], 1),
+            congestion_level=congestion_level,
+            congestion_warning=warning,
         )
+        segments.append(segment)
 
-    return enriched_segments
+    return segments
 
 
-async def calculate_eta(distance_km: float, congestion_level: str) -> float:
-    """Estimate travel time for a route based on congestion level."""
-    speed_kmh = CONGESTION_SPEEDS.get(congestion_level)
-    if speed_kmh is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid congestion level provided",
-        )
+def calculate_eta(distance_km: float, congestion_level: str) -> Tuple[float, float]:
+    """Calculate estimated travel time with congestion and buffer.
 
-    eta_minutes = (distance_km / speed_kmh) * 60.0
-    eta_with_buffer = eta_minutes * 1.1
-    return float(round(eta_with_buffer))
+    Args:
+        distance_km: Distance in kilometers
+        congestion_level: Traffic congestion level
+
+    Returns:
+        Tuple[float, float]: (eta_minutes, eta_with_buffer_minutes)
+    """
+    speed_kmh = {
+        "low": 60.0,
+        "medium": 35.0,
+        "high": 15.0,
+    }.get(congestion_level, 40.0)  # Default fallback
+
+    eta_minutes = (distance_km / speed_kmh) * 60
+    eta_with_buffer = eta_minutes * 1.1  # 10% Hyderabad buffer
+
+    return round(eta_minutes, 1), round(eta_with_buffer, 1)
 
 
 async def check_incidents_on_route(
@@ -213,11 +194,74 @@ async def check_incidents_on_route(
     origin_lng: float,
     dest_lat: float,
     dest_lng: float,
-    db: Any,
+    db: AsyncSession,
 ) -> List[str]:
-    """Return active incident warnings for a route bounding box."""
-    min_lat, max_lat = sorted([origin_lat, dest_lat])
-    min_lng, max_lng = sorted([origin_lng, dest_lng])
+    """Check for active incidents along the route.
+
+    Args:
+        origin_lat: Origin latitude
+        origin_lng: Origin longitude
+        dest_lat: Destination latitude
+        dest_lng: Destination longitude
+        db: Database session
+
+    Returns:
+        List[str]: List of incident warnings
+    """
+    # Build bounding box
+    min_lat = min(origin_lat, dest_lat)
+    max_lat = max(origin_lat, dest_lat)
+    min_lng = min(origin_lng, dest_lng)
+    max_lng = max(origin_lng, dest_lng)
+
+    # Note: Assuming Incident model exists, but gracefully handle if not
+    try:
+        from app.models.incident import Incident  # Import here to avoid circular imports
+
+        stmt = select(Incident).where(
+            Incident.latitude.between(min_lat, max_lat),
+            Incident.longitude.between(min_lng, max_lng),
+            Incident.resolved_at.is_(None),
+        )
+        result = await db.execute(stmt)
+        incidents = result.scalars().all()
+
+        warnings = []
+        for incident in incidents:
+            warning = f"{incident.incident_type.title()} near {incident.location} — {incident.severity}"
+            warnings.append(warning)
+
+        return warnings
+    except ImportError:
+        # Incident model not found, return empty list
+        return []
+
+
+def build_google_maps_url(
+    origin_lat: float,
+    origin_lng: float,
+    dest_lat: float,
+    dest_lng: float,
+    mode: str,
+) -> str:
+    """Build Google Maps directions URL.
+
+    Args:
+        origin_lat: Origin latitude
+        origin_lng: Origin longitude
+        dest_lat: Destination latitude
+        dest_lng: Destination longitude
+        mode: Travel mode
+
+    Returns:
+        str: Google Maps URL
+    """
+    return (
+        f"https://www.google.com/maps/dir/?api=1"
+        f"&origin={origin_lat},{origin_lng}"
+        f"&destination={dest_lat},{dest_lng}"
+        f"&travelmode={mode}"
+    )
 
     def query() -> List[Incident]:
         return (

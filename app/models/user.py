@@ -7,7 +7,6 @@ and authentication status. Includes email indexing for fast lookups.
 
 from datetime import datetime
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, Index
-from sqlalchemy.sql import func
 
 from app.database import Base
 
@@ -30,25 +29,19 @@ class User(Base):
     hashed_password = Column(String(255), nullable=False)
 
     # Profile Fields
-    full_name = Column(String(255), nullable=False)
+    full_name = Column(String(100), nullable=False)
 
     # Status Fields
     is_active = Column(Boolean, default=True, nullable=False, index=True)
     is_admin = Column(Boolean, default=False, nullable=False)
+    is_verified = Column(Boolean, default=False, nullable=False)
+
+    # Activity Fields
+    last_login = Column(DateTime, nullable=True)
 
     # Timestamp Fields
-    created_at = Column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        nullable=False,
-        index=True,
-    )
-    updated_at = Column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        onupdate=func.now(),
-        nullable=False,
-    )
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
     # Composite Index for active user email lookups
     __table_args__ = (

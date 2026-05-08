@@ -5,9 +5,8 @@ Defines a saved route entity for storing user-defined commute routes.
 """
 
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, ForeignKey
+from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Index, Integer, String
 from sqlalchemy.orm import relationship
-from sqlalchemy.sql import func
 
 from app.database import Base
 
@@ -22,19 +21,24 @@ class SavedRoute(Base):
 
     __tablename__ = "saved_routes"
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    route_name = Column(String(255), nullable=False)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    route_name = Column(String(100), nullable=False)
     origin_lat = Column(Float, nullable=False)
     origin_lng = Column(Float, nullable=False)
+    origin_name = Column(String(200), nullable=False)
     destination_lat = Column(Float, nullable=False)
     destination_lng = Column(Float, nullable=False)
-    origin_name = Column(String(255), nullable=False)
-    destination_name = Column(String(255), nullable=False)
-    is_active = Column(Boolean, default=True, nullable=False, index=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    destination_name = Column(String(200), nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     user = relationship("User", back_populates="saved_routes")
+
+    __table_args__ = (
+        Index("ix_saved_routes_user_id", "user_id"),
+        Index("ix_saved_routes_is_active", "is_active"),
+    )
 
     def __repr__(self) -> str:
         """

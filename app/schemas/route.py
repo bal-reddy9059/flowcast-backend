@@ -6,9 +6,9 @@ and saved route persistence.
 """
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
-from pydantic import BaseModel, Field, ConfigDict, field_validator
+from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 
 
 HYDERABAD_LAT_RANGE = (17.0, 17.8)
@@ -65,19 +65,16 @@ class RouteRequest(BaseModel):
             raise ValueError("mode must be one of: driving, walking, transit")
         return value
 
-    @field_validator("origin_lat", "destination_lat")
-    @classmethod
-    def validate_latitude(cls, value: float) -> float:
-        if not (HYDERABAD_LAT_RANGE[0] <= value <= HYDERABAD_LAT_RANGE[1]):
-            raise ValueError("Only Hyderabad routes are supported currently")
-        return value
-
-    @field_validator("origin_lng", "destination_lng")
-    @classmethod
-    def validate_longitude(cls, value: float) -> float:
-        if not (HYDERABAD_LNG_RANGE[0] <= value <= HYDERABAD_LNG_RANGE[1]):
-            raise ValueError("Only Hyderabad routes are supported currently")
-        return value
+    @model_validator(mode="after")
+    def validate_hyderabad_bounds(self) -> "RouteRequest":
+        if not (
+            HYDERABAD_LAT_RANGE[0] <= self.origin_lat <= HYDERABAD_LAT_RANGE[1]
+            and HYDERABAD_LAT_RANGE[0] <= self.destination_lat <= HYDERABAD_LAT_RANGE[1]
+            and HYDERABAD_LNG_RANGE[0] <= self.origin_lng <= HYDERABAD_LNG_RANGE[1]
+            and HYDERABAD_LNG_RANGE[0] <= self.destination_lng <= HYDERABAD_LNG_RANGE[1]
+        ):
+            raise ValueError("Only Hyderabad routes supported currently")
+        return self
 
 
 class CoordinatePair(BaseModel):
@@ -124,6 +121,7 @@ class RouteResponse(BaseModel):
     destination: str = Field(..., description="Human readable destination name", example="Hitech City")
     total_distance_km: float = Field(..., description="Total route distance in kilometers", example=12.0)
     total_eta_minutes: float = Field(..., description="Estimated travel time in minutes", example=35.0)
+    total_eta_with_buffer_minutes: float = Field(..., description="ETA including buffer time in minutes", example=38.5)
     congestion_summary: str = Field(..., description="Overall congestion level for the route", example="medium")
     segments: List[RouteSegment] = Field(..., description="List of route segments")
     warnings: List[str] = Field(..., description="Active incident warnings on the route", example=["Accident near Hitech City"])
@@ -160,6 +158,10 @@ class SavedRouteResponse(BaseModel):
     route_name: str
     origin_name: str
     destination_name: str
+    origin_lat: float
+    origin_lng: float
+    destination_lat: float
+    destination_lng: float
     is_active: bool
     created_at: datetime
 
