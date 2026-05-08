@@ -1,32 +1,29 @@
 # Flowcast Traffic API
 
-A real-time traffic monitoring system with intelligent traffic prediction, incident detection, and network-wide analytics. Built with FastAPI, PostgreSQL, and WebSocket support for live updates.
+A real-time traffic monitoring API with Google Maps live traffic fallback, PostgreSQL persistence, and traffic heatmap support. Built with FastAPI, PostgreSQL, and WebSocket streaming for frontend-friendly live updates.
 
 ---
 
 ## 🚀 Features
 
 ### Core Functionality
-- **Real-Time Traffic Monitoring**: Live traffic data capture and monitoring from multiple sources
-- **Google Maps Integration**: Seamless integration with Google Maps API for traffic data
-- **WebSocket Push Updates**: Real-time bidirectional communication for live traffic updates
-- **Traffic Prediction**: ML-based traffic forecasting with confidence scoring
-- **Incident Detection**: Automatic detection and tracking of traffic incidents (accidents, road work, etc.)
-- **Historical Data**: PostgreSQL-based persistence for historical analysis and auditing
+- **Real-Time Traffic Snapshot**: Current traffic conditions with a single API call
+- **Google Maps Live Traffic**: Optional live traffic data from Google Maps Distance Matrix when `origin` and `destination` are provided
+- **Dummy Traffic Fallback**: Automatic dummy data generation when live traffic data is unavailable
+- **Traffic History Storage**: PostgreSQL persistence for traffic snapshots and historical review
+- **Traffic History Queries**: Filter stored traffic history by location and limit result size
+- **WebSocket Streaming**: Push-based traffic updates every 5 seconds via `/traffic/ws`
 
-### Analytics & Insights
-- **Network Snapshot**: City-wide congestion overview across all monitored locations
-- **Location Summary**: Detailed statistics and active incidents for specific locations
-- **Congestion Trends**: Hourly congestion patterns for trend analysis and forecasting
-- **Vehicle Count Analysis**: Real-time and historical vehicle count metrics
-- **Speed & Travel Time Metrics**: Real-world traffic speed and estimated travel times
+### Heatmap & Visualization
+- **Heatmap Data API**: `/traffic/heatmap` returns intensity points for map overlays
+- **Hotspot Detection**: `/traffic/heatmap/hotspots` returns top congestion hotspot locations
+- **City Summary**: `/traffic/heatmap/summary` computes congestion statistics and location rankings
 
 ### Developer Features
-- **RESTful API**: Clean, well-documented REST endpoints
-- **Swagger/OpenAPI Documentation**: Interactive API documentation at `/docs`
-- **CORS Support**: Cross-origin requests enabled for frontend integration
-- **Dummy Data Generation**: Built-in test data for development and testing
-- **Modular Architecture**: Clean separation of concerns with models, routes, and services
+- **RESTful API**: Simple, documented endpoints for traffic and heatmap data
+- **Swagger/OpenAPI Documentation**: Interactive API docs available at `/docs`
+- **CORS Support**: Frontend-friendly cross-origin access enabled
+- **Modular Architecture**: Clean separation between routers, services, and database setup
 
 ---
 
@@ -97,29 +94,29 @@ The API will be available at `http://localhost:8000`
 ```
 GET /
 ```
-Returns API information and available endpoints.
+Returns API status and available routes.
 
 ### Traffic Data
 ```
 GET /traffic
 ```
-Get real-time traffic snapshot.
+Get a live traffic snapshot. When `origin` and `destination` are provided and a valid `GOOGLE_MAPS_API_KEY` is configured, live Google Maps traffic data is returned. Otherwise, dummy traffic data is served.
 
 ```
 GET /traffic/history
 ```
-Get historical traffic records.
+Read stored traffic snapshots from PostgreSQL with optional location filtering.
 
 ```
 GET /traffic/dummy
 ```
-Generate and retrieve dummy traffic data for testing.
+Return randomized dummy traffic data without persisting to the database.
 
 ### WebSocket
 ```
 WS /traffic/ws
 ```
-Real-time traffic updates via WebSocket connection.
+Real-time traffic updates streamed every 5 seconds.
 
 **Example WebSocket subscription:**
 ```javascript
@@ -130,70 +127,28 @@ ws.onmessage = (event) => {
 };
 ```
 
-### Analytics
+### Heatmap Endpoints
 
-#### Network Snapshot
 ```
-GET /analytics/snapshot?hours=1
+GET /traffic/heatmap
 ```
-Network-wide congestion view across all monitored locations.
+Retrieve heatmap intensity points for map visualization.
 
-**Query Parameters:**
-- `hours` (int): Look-back window (1-24 hours, default: 1)
+Query Parameters:
+- `hours` (int, 1-24): traffic history window to include
+- `congestion_filter` (low|medium|high): optional filter
+- `min_intensity` (float, 0.0-1.0): minimum intensity threshold
+- `limit` (int, 1-1000): maximum number of points returned
 
-**Response:**
-```json
-{
-  "timestamp": "2026-05-07T10:30:00Z",
-  "total_locations": 42,
-  "average_congestion": "moderate",
-  "high_congestion_count": 8,
-  "locations": [...]
-}
 ```
+GET /traffic/heatmap/hotspots
+```
+Get the top congestion hotspots in the current dataset.
 
-#### Location Summary
 ```
-GET /analytics/location?location=Main Street&hours=1
+GET /traffic/heatmap/summary
 ```
-Aggregated statistics and active incidents for a specific location.
-
-**Query Parameters:**
-- `location` (str): Location name (required)
-- `hours` (int): Look-back window (1-24 hours, default: 1)
-
-**Response:**
-```json
-{
-  "location": "Main Street",
-  "vehicle_count_avg": 45,
-  "speed_avg_kmh": 35.5,
-  "congestion_level": "moderate",
-  "incidents": [...]
-}
-```
-
-#### Congestion Trend
-```
-GET /analytics/trend?location=Main Street&intervals=6
-```
-Hourly congestion trend for chart rendering and analysis.
-
-**Query Parameters:**
-- `location` (str): Location name (required)
-- `intervals` (int): Number of hourly buckets (2-24, default: 6)
-
-**Response:**
-```json
-{
-  "location": "Main Street",
-  "trend": [
-    {"hour": 0, "congestion_level": "low", "vehicle_count": 20},
-    {"hour": 1, "congestion_level": "medium", "vehicle_count": 45},
-    ...
-  ]
-}
-```
+Get a city-wide congestion summary with counts, average intensity, and best/worst locations.
 
 ---
 
@@ -208,40 +163,10 @@ Core table for storing traffic observations.
 | `location` | String | Location name |
 | `latitude` | Float | GPS latitude |
 | `longitude` | Float | GPS longitude |
-| `vehicle_count` | Integer | Number of vehicles detected |
-| `average_speed` | Float | Average speed (km/h) |
-| `congestion_level` | String | low \| medium \| high |
-| `road_type` | String | Road category |
-| `timestamp` | DateTime | Data collection time |
-| `created_at` | DateTime | Record creation time |
-
-### PredictionResult
-Traffic prediction records with confidence metrics.
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | Integer | Primary key |
-| `location` | String | Target location |
-| `predicted_congestion` | String | Forecasted congestion level |
-| `confidence_score` | Float | Model confidence (0-1) |
-| `prediction_for` | DateTime | Prediction target time |
-| `model_version` | String | ML model version |
-| `created_at` | DateTime | Prediction timestamp |
-
-### Incident
-Detected traffic incidents (accidents, road work, etc.).
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | Integer | Primary key |
-| `location` | String | Incident location |
-| `latitude` | Float | GPS latitude |
-| `longitude` | Float | GPS longitude |
-| `incident_type` | String | accident \| road_work \| weather \| other |
-| `severity` | String | low \| medium \| high \| critical |
-| `description` | String | Incident details |
-| `resolved_at` | DateTime | Resolution timestamp |
-| `created_at` | DateTime | Detection timestamp |
+| `congestion_level` | String | low \| moderate \| high \| very_high |
+| `speed_kmh` | Float | Average speed in km/h |
+| `travel_time_mins` | Float | Travel time estimate in minutes |
+| `timestamp` | DateTime | Traffic observation timestamp |
 
 ---
 
@@ -251,16 +176,13 @@ Detected traffic incidents (accidents, road work, etc.).
 flowcast-backend/
 ├── app/
 │   ├── models/
-│   │   └── predictor.py          # Database models & schemas
+│   │   └── predictor.py          # Heatmap and traffic models
 │   ├── routes/
-│   │   ├── traffic.py            # Traffic endpoints
-│   │   └── analytics.py          # Analytics endpoints
-│   ├── services/
-│   │   └── realtime.py           # Real-time analysis service
+│   │   └── heatmap.py            # Traffic heatmap endpoints
 │   ├── database.py               # Database configuration
 │   └── __init__.py
 ├── routers/
-│   └── traffic.py                # Traffic router (legacy)
+│   └── traffic.py                # Core traffic router
 ├── services/
 │   └── traffic_service.py        # Traffic business logic
 ├── main.py                        # FastAPI app entry point
@@ -316,14 +238,14 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
 curl http://localhost:8000/traffic
 ```
 
-### Get Analytics Snapshot
+### Get Dummy Traffic Data
 ```bash
-curl "http://localhost:8000/analytics/snapshot?hours=2"
+curl http://localhost:8000/traffic/dummy
 ```
 
-### Get Location Statistics
+### Get Stored Traffic History
 ```bash
-curl "http://localhost:8000/analytics/location?location=Main%20Street&hours=1"
+curl "http://localhost:8000/traffic/history?limit=20&location=Delhi"
 ```
 
 ### Subscribe to Live Updates (WebSocket)
@@ -340,6 +262,21 @@ async def listen():
             print(json.loads(data))
 
 asyncio.run(listen())
+```
+
+### Get Heatmap Data
+```bash
+curl "http://localhost:8000/traffic/heatmap?hours=1&limit=200"
+```
+
+### Get Heatmap Hotspots
+```bash
+curl http://localhost:8000/traffic/heatmap/hotspots
+```
+
+### Get Heatmap Summary
+```bash
+curl http://localhost:8000/traffic/heatmap/summary
 ```
 
 ---
