@@ -4,8 +4,10 @@ Push notification models.
 Defines the Notification table for storing and tracking user alerts.
 """
 
+import uuid
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Index
+from sqlalchemy import Column, String, Boolean, DateTime, ForeignKey, Index
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -22,9 +24,9 @@ class Notification(Base):
 
     __tablename__ = "notifications"
 
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    route_id = Column(Integer, ForeignKey("saved_routes.id", ondelete="SET NULL"), nullable=True)
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    route_id = Column(UUID(as_uuid=True), ForeignKey("saved_routes.id", ondelete="SET NULL"), nullable=True)
 
     title = Column(String(200), nullable=False)
     message = Column(String(500), nullable=False)

@@ -1,6 +1,12 @@
+import uuid as _uuid
+
 from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, Text
 from sqlalchemy.sql import func
 from app.database import Base
+
+
+def _new_uuid() -> str:
+    return str(_uuid.uuid4())
 
 
 class TrafficRecord(Base):
@@ -8,6 +14,13 @@ class TrafficRecord(Base):
     __tablename__ = "traffic_records"
 
     id = Column(Integer, primary_key=True, index=True)
+    record_uuid = Column(
+        String(36),
+        default=_new_uuid,
+        unique=True,
+        nullable=True,   # nullable so existing rows without the column still load
+        index=True,
+    )
     location = Column(String(255), nullable=False, index=True)
     latitude = Column(Float, nullable=True)
     longitude = Column(Float, nullable=True)
@@ -25,6 +38,13 @@ class PredictionResult(Base):
     __tablename__ = "prediction_results"
 
     id = Column(Integer, primary_key=True, index=True)
+    prediction_uuid = Column(
+        String(36),
+        default=_new_uuid,
+        unique=True,
+        nullable=True,
+        index=True,
+    )
     location = Column(String(255), nullable=False, index=True)
     predicted_congestion = Column(String(50), nullable=False)   # low / medium / high
     confidence_score = Column(Float, nullable=True)             # 0.0 – 1.0
@@ -40,6 +60,13 @@ class Incident(Base):
     __tablename__ = "incidents"
 
     id = Column(Integer, primary_key=True, index=True)
+    incident_uuid = Column(
+        String(36),
+        default=_new_uuid,
+        unique=True,
+        nullable=True,
+        index=True,
+    )
     location = Column(String(255), nullable=False, index=True)
     latitude = Column(Float, nullable=True)
     longitude = Column(Float, nullable=True)

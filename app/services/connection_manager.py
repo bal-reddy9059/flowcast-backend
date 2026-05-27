@@ -7,7 +7,7 @@ and targeted message delivery capabilities.
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -199,7 +199,7 @@ class ConnectionManager:
         """
         ping_message = {
             "type": "ping",
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
         result = await self.send_to_user(user_id, ping_message)

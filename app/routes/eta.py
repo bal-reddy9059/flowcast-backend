@@ -9,7 +9,7 @@ from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.predictor import TrafficRecord
@@ -21,6 +21,7 @@ router = APIRouter(tags=["ETA Calculation"])
 logger = logging.getLogger(__name__)
 
 ALLOWED_ETA_MODES = {"driving", "walking", "transit"}
+_ALL_MODES = ["driving", "walking", "transit"]
 
 
 @router.get(
@@ -28,13 +29,13 @@ ALLOWED_ETA_MODES = {"driving", "walking", "transit"}
     response_model=ETAResponse,
     status_code=status.HTTP_200_OK,
 )
-async def get_eta(
+def get_eta(
     location: str = Query(..., min_length=2, description="Hyderabad location name"),
     distance_km: float = Query(
         ..., gt=0, le=500, description="Distance to travel in kilometers"
     ),
     mode: str = Query("driving", description="Travel mode"),
-    db: AsyncSession = Depends(get_db),
+    db: Session = Depends(get_db),
 ) -> ETAResponse:
     """Calculate real-time ETA for a Hyderabad location."""
     normalized_location = location.strip()
@@ -50,7 +51,7 @@ async def get_eta(
         )
 
     logger.info("ETA requested for %s", normalized_location)
-    return await calculate_eta_for_location(
+    return calculate_eta_for_location(
         normalized_location,
         distance_km,
         mode,
@@ -63,9 +64,9 @@ async def get_eta(
     response_model=ETABatchResponse,
     status_code=status.HTTP_200_OK,
 )
-async def post_eta_batch(
+def post_eta_batch(
     request: ETABatchRequest,
-    db: AsyncSession = Depends(get_db),
+    db: Session = Depends(get_db),
 ) -> ETABatchResponse:
     """Calculate ETA for multiple Hyderabad locations at once."""
     if not request.locations:
@@ -88,7 +89,7 @@ async def post_eta_batch(
                 detail="each location must contain at least 2 characters",
             )
         results.append(
-            await calculate_eta_for_location(
+            calculate_eta_for_location(
                 normalized_location,
                 request.distance_km,
                 request.mode,
@@ -114,25 +115,92 @@ async def post_eta_batch(
 
 
 @router.get(
+    "/traffic/eta/compare",
+    status_code=status.HTTP_200_OK,
+)
+def compare_eta_modes(
+    location: str = Query(..., min_length=2, description="Hyderabad location name"),
+    distance_km: float = Query(..., gt=0, le=500, description="Distance in kilometers"),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Compare ETA for driving, walking, and transit side-by-side for one location.
+
+    Returns all three mode results plus the recommended (fastest) mode.
+    """
+    normalized = location.strip()
+    if len(normalized) < 2:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="location must contain at least 2 characters",
+        )
+
+    results = {}
+    for mode in _ALL_MODES:
+        eta = calculate_eta_for_location(normalized, distance_km, mode, db)
+        results[mode] = {
+            "eta_minutes": eta.eta_minutes,
+            "eta_with_buffer_minutes": eta.eta_with_buffer_minutes,
+            "average_speed_kmh": round(eta.average_speed_kmh, 1),
+            "congestion_level": eta.congestion_level,
+            "traffic_condition": eta.traffic_condition,
+            "confidence": eta.confidence,
+            "data_age_minutes": eta.data_age_minutes,
+            "arrival_time": eta.arrival_time.isoformat(),
+        }
+
+    recommended = min(results, key=lambda m: results[m]["eta_minutes"])
+
+    logger.info("ETA compare for %s @ %.1f km — fastest: %s", normalized, distance_km, recommended)
+    return {
+        "location": normalized,
+        "distance_km": distance_km,
+        "modes": results,
+        "recommended_mode": recommended,
+        "calculated_at": eta.calculated_at.isoformat(),
+    }
+
+
+from app.services.city_aliases import CITY_ALIASES as _CITY_ALIASES_MAP
+
+_CITY_LEVEL_SUPPORTED = [k.title() for k in _CITY_ALIASES_MAP]
+
+
+@router.get(
     "/traffic/eta/locations",
     status_code=status.HTTP_200_OK,
 )
-async def get_eta_locations(
-    db: AsyncSession = Depends(get_db),
+def get_eta_locations(
+    db: Session = Depends(get_db),
 ) -> dict:
-    """Get all available monitored locations in Hyderabad for ETA queries."""
+    """Get all monitored locations available for ETA queries across India.
+
+    City-level names (e.g. 'Hyderabad') aggregate traffic across all their
+    neighbourhoods and return a single blended ETA.
+    """
     stmt = select(TrafficRecord.location).distinct().order_by(
         TrafficRecord.location.asc()
     )
-    result = await db.execute(stmt)
-    locations = result.scalars().all() or []
-    total = len(locations)
+    result = db.execute(stmt)
+    raw: list[str] = result.scalars().all() or []
 
-    logger.info("Returned %s available ETA locations", total)
+    # Deduplicate: skip "X, State" when plain "X" already exists
+    names_lower = {loc.lower() for loc in raw}
+    deduplicated: list[str] = []
+    for loc in raw:
+        base = loc.split(",")[0].strip()
+        if base.lower() != loc.lower() and base.lower() in names_lower:
+            continue
+        deduplicated.append(loc)
+
+    logger.info("Returned %s ETA locations (raw %s, deduplicated %s)", len(deduplicated), len(raw), len(raw) - len(deduplicated))
     return {
-        "locations": locations,
-        "total": total,
-        "message": "Use these names with /traffic/eta",
+        "city_level_supported": _CITY_LEVEL_SUPPORTED,
+        "locations": deduplicated,
+        "total": len(deduplicated),
+        "message": (
+            "Pass any location name or city shortcut to /traffic/eta. "
+            "City-level names aggregate ETA across all their neighbourhoods."
+        ),
     }
 
 

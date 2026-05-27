@@ -6,10 +6,11 @@ Provides WebSocket live alerts and REST endpoints for notification management.
 
 import asyncio
 import logging
+import uuid
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
-from sqlalchemy import func
+from sqlalchemy import func, case
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -108,6 +109,7 @@ async def websocket_notifications_endpoint(websocket: WebSocket, user_id: int) -
 @router.get(
     "/history",
     response_model=NotificationSummary,
+    response_model_exclude_none=True,
     status_code=status.HTTP_200_OK,
 )
 async def get_notification_history(
@@ -160,10 +162,11 @@ async def get_notification_history(
 @router.post(
     "/mark-read/{notification_id}",
     response_model=NotificationResponse,
+    response_model_exclude_none=True,
     status_code=status.HTTP_200_OK,
 )
 async def mark_notification_as_read(
-    notification_id: int,
+    notification_id: uuid.UUID,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> NotificationResponse:
@@ -204,26 +207,77 @@ async def mark_all_notifications_read(
     """
     Mark all unread notifications as read for the current authenticated user.
 
-    Args:
-        current_user: Authenticated user from JWT
-        db: Database session
-
-    Returns:
-        Dictionary with success message and count of marked notifications
-
-    Response format:
-        {
-            "message": "X notifications marked as read",
-            "count": X,
-            "user_id": user_id
-        }
+    Returns count of newly marked, already-read, and total notifications.
     """
-    count = await mark_all_read(user_id=current_user.id, db=db)
+    result = await mark_all_read(user_id=current_user.id, db=db)
+
+    marked  = result["marked_count"]
+    already = result["already_read_count"]
+    total   = result["total"]
 
     return {
-        "message": f"{count} notifications marked as read",
-        "count": count,
-        "user_id": current_user.id,
+        "message": (
+            f"{marked} notifications marked as read"
+            if marked > 0
+            else "All notifications were already read"
+        ),
+        "marked_count":       marked,
+        "already_read_count": already,
+        "total_notifications": total,
+        "user_id":   current_user.id,
+        "marked_at": result["marked_at"].isoformat(),
+    }
+
+
+@router.post(
+    "/test",
+    status_code=status.HTTP_201_CREATED,
+)
+async def send_test_notification(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """
+    Create a sample notification for the current user.
+
+    Useful for verifying that the notification history and WebSocket delivery work.
+    """
+    from app.services.notification_service import create_notification
+    from app.services.connection_manager import manager as ws_manager
+    from app.services.notification_service import send_websocket_notification
+
+    severities = [
+        ("High Traffic Alert — Hitech City",   "Heavy congestion detected near Hitech City. Expect delays of 20-30 minutes.", "congestion_alert", "high",     "Hitech City"),
+        ("Moderate Delay — Gachibowli",        "Moderate traffic on your Gachibowli route. Allow extra 10 minutes.",          "congestion_alert", "medium",   "Gachibowli"),
+        ("Incident Reported — Ameerpet",       "Road incident reported near Ameerpet. Consider alternate routes.",             "incident_alert",   "critical", "Ameerpet"),
+    ]
+    import random
+    title, message, ntype, severity, location = random.choice(severities)
+
+    notification = await create_notification(
+        user_id=current_user.id,
+        route_id=None,
+        title=title,
+        message=message,
+        notification_type=ntype,
+        severity=severity,
+        location=location,
+        db=db,
+    )
+    await send_websocket_notification(
+        user_id=current_user.id,
+        notification=notification,
+        manager=ws_manager,
+        db=db,
+    )
+
+    logger.info("Test notification created for user %s", current_user.id)
+    return {
+        "message": "Test notification created successfully.",
+        "notification_id": notification.id,
+        "title":    notification.title,
+        "severity": notification.severity,
+        "location": notification.location,
     }
 
 
@@ -238,58 +292,56 @@ async def get_notification_stats(
     """
     Get notification statistics for the current authenticated user.
 
-    Includes counts of total, unread, and critical notifications,
-    plus timestamp of most recent notification.
-
-    Args:
-        current_user: Authenticated user from JWT
-        db: Database session
-
-    Returns:
-        Dictionary with notification statistics
-
-    Response format:
-        {
-            "user_id": user_id,
-            "total_notifications": int,
-            "unread_count": int,
-            "critical_count": int,
-            "last_notification_at": datetime or None,
-            "active_ws_connections": int
-        }
+    Returns counts by read status, severity breakdown, type breakdown,
+    and the timestamp of the most recent notification.
     """
-    total_count = db.query(func.count(Notification.id)).filter(
-        Notification.user_id == current_user.id
-    ).scalar() or 0
+    uid = current_user.id
 
-    unread_count = db.query(func.count(Notification.id)).filter(
-        Notification.user_id == current_user.id,
-        Notification.is_read.is_(False),
-    ).scalar() or 0
+    # Single aggregated query for all counts
+    row = db.query(
+        func.count(Notification.id).label("total"),
+        func.sum(case((Notification.is_read.is_(False), 1), else_=0)).label("unread"),
+        func.sum(case((Notification.is_read.is_(True),  1), else_=0)).label("read"),
+        func.sum(case((Notification.severity == "critical", 1), else_=0)).label("critical"),
+        func.sum(case((Notification.severity == "high",     1), else_=0)).label("high"),
+        func.sum(case((Notification.severity == "medium",   1), else_=0)).label("medium"),
+        func.sum(case((Notification.severity == "low",      1), else_=0)).label("low"),
+        func.sum(case(((Notification.severity == "critical") & Notification.is_read.is_(False), 1), else_=0)).label("unread_critical"),
+        func.sum(case((Notification.notification_type == "congestion_alert", 1), else_=0)).label("congestion_alerts"),
+        func.sum(case((Notification.notification_type == "incident_alert",   1), else_=0)).label("incident_alerts"),
+        func.sum(case((Notification.notification_type == "route_update",     1), else_=0)).label("route_updates"),
+        func.sum(case((Notification.notification_type == "system",           1), else_=0)).label("system"),
+        func.max(Notification.created_at).label("last_at"),
+    ).filter(Notification.user_id == uid).one()
 
-    critical_count = db.query(func.count(Notification.id)).filter(
-        Notification.user_id == current_user.id,
-        Notification.severity == "critical",
-    ).scalar() or 0
-
-    last_notification = db.query(func.max(Notification.created_at)).filter(
-        Notification.user_id == current_user.id
-    ).scalar()
+    total         = int(row.total or 0)
+    unread_count  = int(row.unread or 0)
+    read_count    = int(row.read   or 0)
 
     logger.info(
-        "User %s retrieved notification stats (total=%s, unread=%s, critical=%s)",
-        current_user.id,
-        total_count,
-        unread_count,
-        critical_count,
+        "User %s retrieved notification stats (total=%s, unread=%s, read=%s)",
+        uid, total, unread_count, read_count,
     )
 
     return {
-        "user_id": current_user.id,
-        "total_notifications": total_count,
-        "unread_count": unread_count,
-        "critical_count": critical_count,
-        "last_notification_at": last_notification,
+        "user_id":             uid,
+        "total_notifications": total,
+        "unread_count":        unread_count,
+        "read_count":          read_count,
+        "severity_breakdown": {
+            "critical": int(row.critical or 0),
+            "high":     int(row.high     or 0),
+            "medium":   int(row.medium   or 0),
+            "low":      int(row.low      or 0),
+        },
+        "unread_critical":     int(row.unread_critical or 0),
+        "type_breakdown": {
+            "congestion_alert": int(row.congestion_alerts or 0),
+            "incident_alert":   int(row.incident_alerts   or 0),
+            "route_update":     int(row.route_updates     or 0),
+            "system":           int(row.system            or 0),
+        },
+        "last_notification_at":  row.last_at,
         "active_ws_connections": manager.get_connection_count(),
     }
 

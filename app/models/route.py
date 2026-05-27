@@ -4,8 +4,10 @@ Route optimization models.
 Defines a saved route entity for storing user-defined commute routes.
 """
 
+import uuid as _uuid
 from datetime import datetime
-from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Index, Integer, String
+from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Index, String
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
 from app.database import Base
@@ -21,8 +23,8 @@ class SavedRoute(Base):
 
     __tablename__ = "saved_routes"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    id = Column(UUID(as_uuid=True), primary_key=True, default=_uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     route_name = Column(String(100), nullable=False)
     origin_lat = Column(Float, nullable=False)
     origin_lng = Column(Float, nullable=False)
@@ -34,6 +36,8 @@ class SavedRoute(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     user = relationship("User", back_populates="saved_routes")
+    # route_id on Notification is nullable (SET NULL on delete), so no delete-orphan here
+    notifications = relationship("Notification", back_populates="route")
 
     __table_args__ = (
         Index("ix_saved_routes_user_id", "user_id"),

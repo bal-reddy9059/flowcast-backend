@@ -80,12 +80,20 @@ class ETAResponse(BaseModel):
     )
     confidence: str = Field(
         ...,
-        description="Data confidence level",
+        description="Data confidence level — high (<15 min old), medium (<60 min), low (>60 min or no data)",
         examples=["high", "medium", "low"]
+    )
+    data_age_minutes: float = Field(
+        0.0,
+        description="Age of the traffic data used for this ETA in minutes"
+    )
+    arrival_time: datetime = Field(
+        ...,
+        description="Estimated arrival time in IST (current time + eta_with_buffer_minutes)"
     )
     calculated_at: datetime = Field(
         ...,
-        description="Timestamp when calculation was performed"
+        description="Timestamp when this ETA was calculated (IST)"
     )
 
 

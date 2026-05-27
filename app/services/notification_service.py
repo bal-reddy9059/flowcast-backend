@@ -7,7 +7,8 @@ and notification history management.
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
+import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from sqlalchemy.orm import Session
@@ -21,14 +22,14 @@ from fastapi import HTTPException, status
 
 logger = logging.getLogger(__name__)
 
-HYDERABAD_RADIUS_DEGREES = 0.02
+CONGESTION_RADIUS_DEGREES = 0.5   # ~55 km — wide enough for district-level data
 CONGESTION_CHECK_INTERVAL = 60
 NOTIFICATION_COOLDOWN_MINUTES = 30
 
 
 async def create_notification(
-    user_id: int,
-    route_id: Optional[int],
+    user_id: uuid.UUID,
+    route_id: Optional[uuid.UUID],
     title: str,
     message: str,
     notification_type: str,
@@ -184,13 +185,14 @@ async def check_saved_routes_for_congestion(db: Session, manager: Any) -> None:
                     db.query(TrafficRecord)
                     .filter(
                         TrafficRecord.latitude.between(
-                            route.origin_lat - HYDERABAD_RADIUS_DEGREES,
-                            route.origin_lat + HYDERABAD_RADIUS_DEGREES,
+                            route.origin_lat - CONGESTION_RADIUS_DEGREES,
+                            route.origin_lat + CONGESTION_RADIUS_DEGREES,
                         ),
                         TrafficRecord.longitude.between(
-                            route.origin_lng - HYDERABAD_RADIUS_DEGREES,
-                            route.origin_lng + HYDERABAD_RADIUS_DEGREES,
+                            route.origin_lng - CONGESTION_RADIUS_DEGREES,
+                            route.origin_lng + CONGESTION_RADIUS_DEGREES,
                         ),
+                        TrafficRecord.created_at >= datetime.now(timezone.utc) - timedelta(hours=2),
                     )
                     .order_by(TrafficRecord.created_at.desc())
                     .first()
@@ -199,7 +201,7 @@ async def check_saved_routes_for_congestion(db: Session, manager: Any) -> None:
                 if not recent_traffic or recent_traffic.congestion_level != "high":
                     continue
 
-                cooldown_threshold = datetime.utcnow() - timedelta(minutes=NOTIFICATION_COOLDOWN_MINUTES)
+                cooldown_threshold = datetime.now(timezone.utc) - timedelta(minutes=NOTIFICATION_COOLDOWN_MINUTES)
                 recent_alert = (
                     db.query(Notification)
                     .filter(
@@ -262,7 +264,7 @@ async def check_saved_routes_for_congestion(db: Session, manager: Any) -> None:
 
 
 async def get_user_notifications(
-    user_id: int,
+    user_id: uuid.UUID,
     skip: int,
     limit: int,
     unread_only: bool,
@@ -285,31 +287,22 @@ async def get_user_notifications(
         Exception: If database query fails
     """
     try:
-        query = db.query(Notification).filter(Notification.user_id == user_id)
+        base_query = db.query(Notification).filter(Notification.user_id == user_id)
 
+        # Summary counts — always unfiltered
+        total_count    = base_query.count()
+        unread_count   = base_query.filter(Notification.is_read.is_(False)).count()
+        critical_count = base_query.filter(Notification.severity == "critical").count()
+
+        # Filtered + paginated results
+        filtered_query = db.query(Notification).filter(Notification.user_id == user_id)
         if unread_only:
-            query = query.filter(Notification.is_read.is_(False))
+            filtered_query = filtered_query.filter(Notification.is_read.is_(False))
 
-        total_count = query.count()
-        unread_count = (
-            db.query(Notification)
-            .filter(
-                Notification.user_id == user_id,
-                Notification.is_read.is_(False),
-            )
-            .count()
-        )
-        critical_count = (
-            db.query(Notification)
-            .filter(
-                Notification.user_id == user_id,
-                Notification.severity == "critical",
-            )
-            .count()
-        )
-
+        page_total = filtered_query.count()
         notifications = (
-            query.order_by(Notification.created_at.desc())
+            filtered_query
+            .order_by(Notification.created_at.desc())
             .offset(skip)
             .limit(limit)
             .all()
@@ -320,17 +313,15 @@ async def get_user_notifications(
         ]
 
         logger.info(
-            "Retrieved %s notifications for user %s (total: %s, unread: %s)",
-            len(notifications),
-            user_id,
-            total_count,
-            unread_count,
+            "Retrieved %s notifications for user %s (total=%s, unread=%s, page_total=%s)",
+            len(notification_responses), user_id, total_count, unread_count, page_total,
         )
 
         return NotificationSummary(
             total=total_count,
             unread=unread_count,
             critical=critical_count,
+            page_total=page_total,
             notifications=notification_responses,
         )
 
@@ -340,8 +331,8 @@ async def get_user_notifications(
 
 
 async def mark_notification_read(
-    notification_id: int,
-    user_id: int,
+    notification_id: uuid.UUID,
+    user_id: uuid.UUID,
     db: Session,
 ) -> Notification:
     """
@@ -378,7 +369,7 @@ async def mark_notification_read(
             )
 
         notification.is_read = True
-        notification.read_at = datetime.utcnow()
+        notification.read_at = datetime.now(timezone.utc)
         db.commit()
         db.refresh(notification)
 
@@ -403,24 +394,30 @@ async def mark_notification_read(
         raise
 
 
-async def mark_all_read(user_id: int, db: Session) -> int:
+async def mark_all_read(user_id: uuid.UUID, db: Session) -> dict:
     """
     Mark all unread notifications as read for a user.
 
     Args:
-        user_id: ID of the user
+        user_id: UUID of the user
         db: Database session
 
     Returns:
-        Count of notifications marked as read
-
-    Raises:
-        Exception: If database update fails
+        Dict with marked_count, already_read_count, total, and marked_at
     """
     try:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
-        result = (
+        total_count = db.query(Notification).filter(
+            Notification.user_id == user_id
+        ).count()
+
+        already_read = db.query(Notification).filter(
+            Notification.user_id == user_id,
+            Notification.is_read.is_(True),
+        ).count()
+
+        marked_count = (
             db.query(Notification)
             .filter(
                 Notification.user_id == user_id,
@@ -437,12 +434,18 @@ async def mark_all_read(user_id: int, db: Session) -> int:
         db.commit()
 
         logger.info(
-            "Marked %s notifications as read for user %s",
-            result,
+            "Marked %s notifications as read for user %s (%s were already read)",
+            marked_count,
             user_id,
+            already_read,
         )
 
-        return result
+        return {
+            "marked_count": marked_count,
+            "already_read_count": already_read,
+            "total": total_count,
+            "marked_at": now,
+        }
 
     except Exception as error:
         db.rollback()

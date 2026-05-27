@@ -6,13 +6,17 @@ Provides real-time ETA calculations using stored traffic observations.
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, Tuple
+from typing import Any
+from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func
+from sqlalchemy.orm import Session
 
 from app.models.predictor import TrafficRecord
 from app.schemas.eta import ETAResponse
+from app.services.city_aliases import CITY_ALIASES as _CITY_ALIASES
+
+_IST = ZoneInfo("Asia/Kolkata")
 
 logger = logging.getLogger(__name__)
 
@@ -52,54 +56,98 @@ def calculate_eta_minutes(distance_km: float, speed_kmh: float) -> tuple[float, 
     return round(eta_minutes, 1), round(eta_with_buffer_minutes, 1)
 
 
-async def get_location_traffic(location: str, db: AsyncSession) -> tuple[Any, str]:
-    """Fetch the latest traffic record for a location and derive confidence."""
+def get_location_traffic(location: str, db: Session) -> tuple[Any, str, float]:
+    """Fetch the latest traffic record for a location and derive confidence.
+
+    For city names (e.g. 'Hyderabad'), aggregates across all known neighbourhoods.
+    Returns (record_or_aggregate, confidence, age_minutes).
+    """
+    from sqlalchemy import or_
+
+    now = datetime.now(_IST)
+    aliases = _CITY_ALIASES.get(location.lower())
+
+    if aliases:
+        # City-level: average across all neighbourhood records from last 2 hours
+        rows = (
+            db.query(
+                func.avg(TrafficRecord.average_speed).label("avg_speed"),
+                func.avg(TrafficRecord.vehicle_count).label("avg_vehicles"),
+                func.max(TrafficRecord.created_at).label("latest"),
+                func.count(TrafficRecord.id).label("cnt"),
+            )
+            .filter(
+                or_(*[TrafficRecord.location.ilike(f"%{a}%") for a in aliases]),
+                TrafficRecord.average_speed.isnot(None),
+            )
+            .first()
+        )
+
+        if not rows or not rows.avg_speed:
+            logger.info("No city-level traffic data for %s", location)
+            return None, "low", 0.0
+
+        # Build a pseudo-record dict
+        latest = rows.latest
+        if latest and latest.tzinfo is None:
+            latest = latest.replace(tzinfo=timezone.utc)
+        age_minutes = (now.astimezone(timezone.utc) - latest.astimezone(timezone.utc)).total_seconds() / 60.0 if latest else 999.0
+
+        # Determine congestion from average speed
+        avg_speed = float(rows.avg_speed)
+        if avg_speed >= 50:
+            congestion = "low"
+        elif avg_speed >= 25:
+            congestion = "medium"
+        else:
+            congestion = "high"
+
+        class _Aggregate:
+            average_speed = avg_speed
+            vehicle_count = int(rows.avg_vehicles or 0)
+            congestion_level = congestion
+            created_at = latest
+
+        confidence = "high" if age_minutes < 15 else "medium" if age_minutes < 60 else "low"
+        logger.info("City ETA for %s: avg_speed=%.1f age=%.0f min confidence=%s", location, avg_speed, age_minutes, confidence)
+        return _Aggregate(), confidence, round(age_minutes, 1)
+
+    # Single location
     stmt = (
         select(TrafficRecord)
         .where(TrafficRecord.location.ilike(f"%{location}%"))
         .order_by(TrafficRecord.created_at.desc())
         .limit(1)
     )
-    logger.debug("Querying latest traffic record for location: %s", location)
-    result = await db.execute(stmt)
+    result = db.execute(stmt)
     record = result.scalars().first()
 
     if not record:
         logger.info("No traffic data for %s", location)
-        return None, "low"
+        return None, "low", 0.0
 
-    now = datetime.now(timezone.utc)
     created_at = record.created_at
+    age_minutes = 0.0
     if created_at is None:
         confidence = "low"
     else:
         if created_at.tzinfo is None:
             created_at = created_at.replace(tzinfo=timezone.utc)
-        age_minutes = (now - created_at).total_seconds() / 60.0
-        if age_minutes < 15:
-            confidence = "high"
-        elif age_minutes < 60:
-            confidence = "medium"
-        else:
-            confidence = "low"
+        age_minutes = (now.astimezone(timezone.utc) - created_at.astimezone(timezone.utc)).total_seconds() / 60.0
+        confidence = "high" if age_minutes < 15 else "medium" if age_minutes < 60 else "low"
 
-    logger.debug(
-        "Latest traffic record for %s age=%.1f minutes confidence=%s",
-        location,
-        age_minutes,
-        confidence,
-    )
-    return record, confidence
+    logger.debug("ETA record for %s age=%.1f min confidence=%s", location, age_minutes, confidence)
+    return record, confidence, round(age_minutes, 1)
 
 
-async def calculate_eta_for_location(
+def calculate_eta_for_location(
     location: str,
     distance_km: float,
     mode: str,
-    db: AsyncSession,
+    db: Session,
 ) -> ETAResponse:
     """Calculate ETA for a location using the latest traffic record and travel mode."""
-    record, confidence = await get_location_traffic(location, db)
+    record, confidence, data_age_minutes = get_location_traffic(location, db)
 
     if record:
         congestion_level = record.congestion_level or "medium"
@@ -116,12 +164,13 @@ async def calculate_eta_for_location(
     eta_minutes, eta_with_buffer_minutes = calculate_eta_minutes(distance_km, final_speed)
     traffic_condition = TRAFFIC_CONDITIONS.get(congestion_level, TRAFFIC_CONDITIONS["medium"])
 
+    now_ist = datetime.now(_IST)
+    from datetime import timedelta
+    arrival_time = now_ist + timedelta(minutes=eta_with_buffer_minutes)
+
     logger.info(
-        "ETA for %s: %.1f mins congestion=%s confidence=%s",
-        location,
-        eta_minutes,
-        congestion_level,
-        confidence,
+        "ETA for %s: %.1f mins congestion=%s confidence=%s data_age=%.0f min",
+        location, eta_minutes, congestion_level, confidence, data_age_minutes,
     )
 
     return ETAResponse(
@@ -134,5 +183,7 @@ async def calculate_eta_for_location(
         vehicle_count=vehicle_count,
         traffic_condition=traffic_condition,
         confidence=confidence,
-        calculated_at=datetime.now(timezone.utc),
+        data_age_minutes=data_age_minutes,
+        arrival_time=arrival_time,
+        calculated_at=now_ist,
     )
