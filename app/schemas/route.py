@@ -5,14 +5,15 @@ Defines request and response models for route calculations, segment details,
 and saved route persistence.
 """
 
+import uuid
 from datetime import datetime
 from typing import List, Optional
 
 from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 
 
-HYDERABAD_LAT_RANGE = (17.0, 17.8)
-HYDERABAD_LNG_RANGE = (78.0, 78.9)
+INDIA_LAT_RANGE = (6.0, 37.5)
+INDIA_LNG_RANGE = (68.0, 97.5)
 ALLOWED_MODES = {"driving", "walking", "transit"}
 CONGESTION_LEVELS = {"low", "medium", "high"}
 
@@ -66,14 +67,15 @@ class RouteRequest(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def validate_hyderabad_bounds(self) -> "RouteRequest":
-        if not (
-            HYDERABAD_LAT_RANGE[0] <= self.origin_lat <= HYDERABAD_LAT_RANGE[1]
-            and HYDERABAD_LAT_RANGE[0] <= self.destination_lat <= HYDERABAD_LAT_RANGE[1]
-            and HYDERABAD_LNG_RANGE[0] <= self.origin_lng <= HYDERABAD_LNG_RANGE[1]
-            and HYDERABAD_LNG_RANGE[0] <= self.destination_lng <= HYDERABAD_LNG_RANGE[1]
-        ):
-            raise ValueError("Only Hyderabad routes supported currently")
+    def validate_india_bounds(self) -> "RouteRequest":
+        for lat, lng in [(self.origin_lat, self.origin_lng), (self.destination_lat, self.destination_lng)]:
+            if not (INDIA_LAT_RANGE[0] <= lat <= INDIA_LAT_RANGE[1]
+                    and INDIA_LNG_RANGE[0] <= lng <= INDIA_LNG_RANGE[1]):
+                raise ValueError(
+                    f"Coordinates ({lat}, {lng}) are outside India. "
+                    f"Valid range: lat {INDIA_LAT_RANGE[0]}–{INDIA_LAT_RANGE[1]}, "
+                    f"lng {INDIA_LNG_RANGE[0]}–{INDIA_LNG_RANGE[1]}."
+                )
         return self
 
 
@@ -126,11 +128,16 @@ class RouteResponse(BaseModel):
     segments: List[RouteSegment] = Field(..., description="List of route segments")
     warnings: List[str] = Field(..., description="Active incident warnings on the route", example=["Accident near Hitech City"])
     google_maps_url: str = Field(..., description="Deep link to Google Maps directions", example="https://www.google.com/maps/dir/?api=1&origin=17.3850,78.4867&destination=17.4400,78.3900&travelmode=driving")
+    route_source: str = Field(
+        "google_maps",
+        description="Provider that computed the route: google_maps | openrouteservice | local_estimate",
+        example="google_maps",
+    )
     fetched_at: datetime = Field(..., description="Timestamp when route data was fetched")
 
     model_config = ConfigDict(
         from_attributes=True,
-        extra="forbid",
+        extra="ignore",
     )
 
 
@@ -153,8 +160,8 @@ class SavedRouteCreate(BaseModel):
 class SavedRouteResponse(BaseModel):
     """Response schema for a saved route record."""
 
-    id: int
-    user_id: int
+    id: uuid.UUID
+    user_id: uuid.UUID
     route_name: str
     origin_name: str
     destination_name: str

@@ -3,6 +3,7 @@
 Defines request and response models for user registration, login, and JWT token handling.
 """
 
+import uuid
 from datetime import datetime
 from typing import Optional
 
@@ -43,16 +44,18 @@ class UserLogin(BaseModel):
 class UserResponse(BaseModel):
     """Schema returned when exposing authenticated user information."""
 
-    id: int
+    id: uuid.UUID
     email: EmailStr
     full_name: str
     is_active: bool
     is_admin: bool
     is_verified: bool
-    last_login: Optional[datetime]
+    auth_provider: str
+    picture_url: Optional[str] = None
+    last_login: Optional[datetime] = None
     created_at: datetime
 
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(from_attributes=True, extra="ignore")
 
 
 class TokenResponse(BaseModel):
@@ -68,4 +71,4 @@ class TokenData(BaseModel):
     """Schema for decoded JWT payload data used internally."""
 
     email: Optional[str] = Field(None, description="User email extracted from token payload")
-    user_id: Optional[int] = Field(None, description="User ID extracted from token payload")
+    user_id: Optional[uuid.UUID] = Field(None, description="User ID extracted from token payload")

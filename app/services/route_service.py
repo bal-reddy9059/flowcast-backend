@@ -6,21 +6,33 @@ incident checking, and Google Maps URL generation for Hyderabad routes.
 """
 
 import logging
+import math
 import os
 from datetime import datetime
 from typing import List, Tuple
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import httpx
 from fastapi import HTTPException, status
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 
 from app.models.predictor import TrafficRecord
 from app.schemas.route import RouteSegment
 
 logger = logging.getLogger(__name__)
 
-GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_DIRECTIONS_API_KEY")
+ORS_API_KEY = os.getenv("ORS_API_KEY")
+
+_ORS_PROFILE = {
+    "driving": "driving-car",
+    "walking": "foot-walking",
+    "transit": "driving-car",
+}
 
 
 async def get_route_from_google(
@@ -110,10 +122,154 @@ async def get_route_from_google(
         "steps": steps,
         "total_distance_km": total_distance_km,
         "total_duration_minutes": total_duration_minutes,
+        "source": "google_maps",
     }
 
 
-async def enrich_route_with_traffic(route_data: dict, db: AsyncSession) -> List[RouteSegment]:
+async def get_route_from_ors(
+    origin_lat: float,
+    origin_lng: float,
+    dest_lat: float,
+    dest_lng: float,
+    mode: str,
+) -> dict:
+    """Fetch route from OpenRouteService (free fallback for Google Maps).
+
+    ORS uses [longitude, latitude] coordinate order.
+    """
+    if not ORS_API_KEY or ORS_API_KEY == "your_ors_key_here":
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No routing service available — configure GOOGLE_MAPS_DIRECTIONS_API_KEY or ORS_API_KEY",
+        )
+
+    profile = _ORS_PROFILE.get(mode, "driving-car")
+    url = f"https://api.openrouteservice.org/v2/directions/{profile}"
+    headers = {"Authorization": ORS_API_KEY, "Content-Type": "application/json"}
+    body = {
+        "coordinates": [[origin_lng, origin_lat], [dest_lng, dest_lat]],
+        "instructions": True,
+    }
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            response = await client.post(url, json=body, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+        except httpx.HTTPError as e:
+            logger.error("ORS API call failed: %s", e)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Routing service unavailable",
+            )
+
+    feature = data["features"][0]
+    props = feature["properties"]
+    coords = feature["geometry"]["coordinates"]  # [lng, lat] pairs
+    ors_steps = props["segments"][0]["steps"]
+    summary = props["summary"]
+
+    steps = []
+    for step in ors_steps:
+        wp = step["way_points"]
+        start = coords[wp[0]]
+        end = coords[wp[-1]]
+        steps.append({
+            "start_location": {"lat": start[1], "lng": start[0]},
+            "end_location": {"lat": end[1], "lng": end[0]},
+            "distance_km": step["distance"] / 1000,
+            "duration_minutes": step["duration"] / 60,
+        })
+
+    logger.info("Fetched route from ORS: %.2f km, %.1f minutes", summary["distance"] / 1000, summary["duration"] / 60)
+
+    return {
+        "steps": steps,
+        "total_distance_km": summary["distance"] / 1000,
+        "total_duration_minutes": summary["duration"] / 60,
+        "source": "openrouteservice",
+    }
+
+
+def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """Straight-line great-circle distance between two GPS points in km."""
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlng = math.radians(lng2 - lng1)
+    a = (math.sin(dlat / 2) ** 2
+         + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlng / 2) ** 2)
+    return R * 2 * math.asin(math.sqrt(a))
+
+
+def _local_route(
+    origin_lat: float, origin_lng: float,
+    dest_lat: float, dest_lng: float,
+) -> dict:
+    """Estimate route using straight-line distance when no external API is available.
+
+    Applies a 1.3× road-distance factor and splits the trip into two segments
+    via the midpoint so downstream traffic enrichment has something to work with.
+    """
+    straight_km = _haversine_km(origin_lat, origin_lng, dest_lat, dest_lng)
+    road_km = round(straight_km * 1.3, 2)          # road is ~30 % longer than straight line
+    duration_min = round((road_km / 35.0) * 60, 1) # 35 km/h average urban speed
+
+    mid_lat = (origin_lat + dest_lat) / 2
+    mid_lng = (origin_lng + dest_lng) / 2
+    half_km = road_km / 2
+    half_min = duration_min / 2
+
+    return {
+        "steps": [
+            {
+                "start_location": {"lat": origin_lat, "lng": origin_lng},
+                "end_location":   {"lat": mid_lat,    "lng": mid_lng},
+                "distance_km":    half_km,
+                "duration_minutes": half_min,
+            },
+            {
+                "start_location": {"lat": mid_lat,  "lng": mid_lng},
+                "end_location":   {"lat": dest_lat, "lng": dest_lng},
+                "distance_km":    half_km,
+                "duration_minutes": half_min,
+            },
+        ],
+        "total_distance_km": road_km,
+        "total_duration_minutes": duration_min,
+        "source": "local_estimate",
+    }
+
+
+async def get_route(
+    origin_lat: float,
+    origin_lng: float,
+    dest_lat: float,
+    dest_lng: float,
+    mode: str,
+    api_key: str,
+) -> dict:
+    """Try Google Maps → ORS → local haversine estimate (never returns 503)."""
+    if api_key and api_key != "your_google_maps_key_here":
+        try:
+            return await get_route_from_google(origin_lat, origin_lng, dest_lat, dest_lng, mode, api_key)
+        except HTTPException as exc:
+            if exc.status_code == status.HTTP_400_BAD_REQUEST:
+                raise
+            logger.warning("Google Maps failed (%s) — trying ORS fallback", exc.detail)
+
+    try:
+        return await get_route_from_ors(origin_lat, origin_lng, dest_lat, dest_lng, mode)
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_400_BAD_REQUEST:
+            raise
+        logger.warning("ORS failed (%s) — using local haversine estimate", exc.detail)
+
+    logger.info("Using local route estimate for (%.4f,%.4f)→(%.4f,%.4f)",
+                origin_lat, origin_lng, dest_lat, dest_lng)
+    return _local_route(origin_lat, origin_lng, dest_lat, dest_lng)
+
+
+async def enrich_route_with_traffic(route_data: dict, db: Session) -> List[RouteSegment]:
     """Enrich route steps with real-time traffic data.
 
     Args:
@@ -136,7 +292,7 @@ async def enrich_route_with_traffic(route_data: dict, db: AsyncSession) -> List[
             TrafficRecord.longitude.between(mid_lng - 0.01, mid_lng + 0.01),
         ).order_by(TrafficRecord.timestamp.desc()).limit(1)
 
-        result = await db.execute(stmt)
+        result = db.execute(stmt)
         record = result.scalars().first()
 
         if record:
@@ -194,7 +350,7 @@ async def check_incidents_on_route(
     origin_lng: float,
     dest_lat: float,
     dest_lng: float,
-    db: AsyncSession,
+    db: Session,
 ) -> List[str]:
     """Check for active incidents along the route.
 
@@ -216,14 +372,14 @@ async def check_incidents_on_route(
 
     # Note: Assuming Incident model exists, but gracefully handle if not
     try:
-        from app.models.incident import Incident  # Import here to avoid circular imports
+        from app.models.predictor import Incident  # noqa: PLC0415
 
         stmt = select(Incident).where(
             Incident.latitude.between(min_lat, max_lat),
             Incident.longitude.between(min_lng, max_lng),
             Incident.resolved_at.is_(None),
         )
-        result = await db.execute(stmt)
+        result = db.execute(stmt)
         incidents = result.scalars().all()
 
         warnings = []
@@ -258,44 +414,6 @@ def build_google_maps_url(
     """
     return (
         f"https://www.google.com/maps/dir/?api=1"
-        f"&origin={origin_lat},{origin_lng}"
-        f"&destination={dest_lat},{dest_lng}"
-        f"&travelmode={mode}"
-    )
-
-    def query() -> List[Incident]:
-        return (
-            db.query(Incident)
-            .filter(
-                Incident.latitude.between(min_lat, max_lat),
-                Incident.longitude.between(min_lng, max_lng),
-                Incident.resolved_at.is_(None),
-                Incident.is_active.is_(True),
-            )
-            .all()
-        )
-
-    incidents = await asyncio.to_thread(query)
-    warnings: List[str] = []
-
-    for incident in incidents:
-        warnings.append(
-            f"{incident.incident_type.title()} near {incident.location} — Severity: {incident.severity}"
-        )
-
-    return warnings
-
-
-async def build_google_maps_url(
-    origin_lat: float,
-    origin_lng: float,
-    dest_lat: float,
-    dest_lng: float,
-    mode: str,
-) -> str:
-    """Build a Google Maps directions deep link for the requested route."""
-    return (
-        "https://www.google.com/maps/dir/?api=1"
         f"&origin={origin_lat},{origin_lng}"
         f"&destination={dest_lat},{dest_lng}"
         f"&travelmode={mode}"
