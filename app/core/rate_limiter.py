@@ -19,7 +19,12 @@ logger = logging.getLogger(__name__)
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
-limiter = Limiter(key_func=get_remote_address, default_limits=["100/minute"], storage_uri=REDIS_URL)
+try:
+    limiter = Limiter(key_func=get_remote_address, default_limits=["100/minute"], storage_uri=REDIS_URL)
+    logger.info("Rate limiter using Redis storage: %s", REDIS_URL)
+except Exception:
+    logger.warning("Redis unavailable — rate limiter falling back to in-memory storage")
+    limiter = Limiter(key_func=get_remote_address, default_limits=["100/minute"])
 
 
 def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:

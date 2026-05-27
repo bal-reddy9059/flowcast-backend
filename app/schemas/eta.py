@@ -1,125 +1,167 @@
 """
-ETA schemas for the FlowCast ETA calculation feature.
+ETA calculation schemas for FlowCast.
 
-Defines request and response models for single and batch ETA lookups.
+Pydantic v2 models for single and batch ETA requests and responses.
 """
 
 from datetime import datetime
 from typing import List
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
-
-ALLOWED_ETA_MODES = {"driving", "walking", "transit"}
+from pydantic import BaseModel, Field, field_validator, ConfigDict
 
 
 class ETARequest(BaseModel):
-    """Request schema for an ETA calculation at a single location."""
+    """Request schema for single location ETA calculation.
+
+    Calculates estimated travel time based on real-time traffic data.
+    """
+    model_config = ConfigDict(extra="forbid")
 
     location: str = Field(
         ...,
         min_length=2,
         max_length=200,
-        description="Name of the monitored Hyderabad location",
-        example="Hitech City",
+        description="Location name in Hyderabad",
+        examples=["Hitech City", "Gachibowli", "Banjara Hills"]
     )
     distance_km: float = Field(
         ...,
         gt=0,
         le=500,
         description="Distance to travel in kilometers",
-        example=12.5,
+        examples=[12.5, 25.0, 8.3]
     )
     mode: str = Field(
-        "driving",
-        description="Travel mode used for ETA calculation",
-        example="driving",
+        default="driving",
+        description="Travel mode",
+        examples=["driving", "walking", "transit"]
     )
 
-    model_config = ConfigDict(
-        extra="forbid",
-    )
-
-    @field_validator("mode")
+    @field_validator('mode')
     @classmethod
-    def validate_mode(cls, value: str) -> str:
-        if value not in ALLOWED_ETA_MODES:
-            raise ValueError("mode must be driving, walking, or transit")
-        return value
+    def validate_mode(cls, v: str) -> str:
+        """Validate that mode is one of the allowed values."""
+        allowed_modes = ["driving", "walking", "transit"]
+        if v not in allowed_modes:
+            raise ValueError("mode must be driving, walking or transit")
+        return v
 
 
 class ETAResponse(BaseModel):
-    """Response schema for a calculated ETA result."""
+    """Response schema for ETA calculation results.
 
-    location: str = Field(..., description="Location name used for the ETA calculation")
-    distance_km: float = Field(..., description="Distance used for the ETA calculation")
+    Contains detailed traffic information and estimated travel times.
+    """
+    model_config = ConfigDict(from_attributes=True)
+
+    location: str = Field(..., description="Location name")
+    distance_km: float = Field(..., description="Distance in kilometers")
     eta_minutes: float = Field(..., description="Estimated travel time in minutes")
     eta_with_buffer_minutes: float = Field(
-        ..., description="ETA with a 10% buffer added"
+        ...,
+        description="ETA with 10% buffer for Hyderabad traffic"
     )
-    congestion_level: str = Field(..., description="Current congestion classification")
-    average_speed_kmh: float = Field(..., description="Average speed used for the calculation")
-    vehicle_count: int = Field(..., description="Vehicle count observed at the location")
+    congestion_level: str = Field(
+        ...,
+        description="Current congestion level",
+        examples=["low", "medium", "high"]
+    )
+    average_speed_kmh: float = Field(
+        ...,
+        description="Average speed in km/h based on congestion"
+    )
+    vehicle_count: int = Field(
+        ...,
+        description="Number of vehicles in the area"
+    )
     traffic_condition: str = Field(
         ...,
-        description="Human readable traffic condition description",
-        example="Moderate traffic — slight delays possible",
+        description="Human-readable traffic condition description"
     )
     confidence: str = Field(
         ...,
-        description="Confidence level for the ETA estimate",
-        example="high",
+        description="Data confidence level — high (<15 min old), medium (<60 min), low (>60 min or no data)",
+        examples=["high", "medium", "low"]
     )
-    calculated_at: datetime = Field(..., description="Timestamp when the ETA was calculated")
-
-    model_config = ConfigDict(
-        from_attributes=True,
-        extra="forbid",
+    data_age_minutes: float = Field(
+        0.0,
+        description="Age of the traffic data used for this ETA in minutes"
+    )
+    arrival_time: datetime = Field(
+        ...,
+        description="Estimated arrival time in IST (current time + eta_with_buffer_minutes)"
+    )
+    calculated_at: datetime = Field(
+        ...,
+        description="Timestamp when this ETA was calculated (IST)"
     )
 
 
 class ETABatchRequest(BaseModel):
-    """Request schema for calculating ETA for multiple locations."""
+    """Request schema for batch ETA calculation across multiple locations.
+
+    Calculates ETA for multiple Hyderabad locations simultaneously.
+    """
+    model_config = ConfigDict(extra="forbid")
 
     locations: List[str] = Field(
         ...,
         min_length=1,
         max_length=10,
-        description="List of Hyderabad locations to calculate ETA for",
-        example=["Gachibowli", "Hitech City", "Banjara Hills"],
+        description="List of location names in Hyderabad",
+        examples=[["Gachibowli", "Hitech City", "Banjara Hills"]]
     )
     distance_km: float = Field(
         ...,
         gt=0,
-        description="Distance in kilometers to use for all locations",
-        example=12.5,
+        le=500,
+        description="Distance to travel in kilometers",
+        examples=[12.5, 25.0, 8.3]
     )
     mode: str = Field(
-        "driving",
-        description="Travel mode used for all ETA calculations",
-        example="driving",
+        default="driving",
+        description="Travel mode",
+        examples=["driving", "walking", "transit"]
     )
 
-    model_config = ConfigDict(
-        extra="forbid",
-    )
-
-    @field_validator("mode")
+    @field_validator('mode')
     @classmethod
-    def validate_mode(cls, value: str) -> str:
-        if value not in ALLOWED_ETA_MODES:
-            raise ValueError("mode must be driving, walking, or transit")
-        return value
+    def validate_mode(cls, v: str) -> str:
+        """Validate that mode is one of the allowed values."""
+        allowed_modes = ["driving", "walking", "transit"]
+        if v not in allowed_modes:
+            raise ValueError("mode must be driving, walking or transit")
+        return v
 
 
 class ETABatchResponse(BaseModel):
-    """Response schema for batch ETA results."""
+    """Response schema for batch ETA calculation results.
 
-    results: List[ETAResponse] = Field(..., description="Calculated ETA results for each location")
-    total_locations: int = Field(..., description="Total number of requested locations")
-    fastest_location: str = Field(..., description="Location with the lowest ETA")
-    slowest_location: str = Field(..., description="Location with the highest ETA")
-    calculated_at: datetime = Field(..., description="Timestamp when the batch ETA calculation completed")
+    Contains ETA results for multiple locations with summary statistics.
+    """
+    model_config = ConfigDict(from_attributes=True)
 
-    model_config = ConfigDict(
-        extra="forbid",
+    results: List[ETAResponse] = Field(
+        ...,
+        description="List of ETA results for each location"
+    )
+    total_locations: int = Field(
+        ...,
+        description="Total number of locations processed"
+    )
+    fastest_location: str = Field(
+        ...,
+        description="Location with the fastest ETA"
+    )
+    slowest_location: str = Field(
+        ...,
+        description="Location with the slowest ETA"
+    )
+    average_eta_minutes: float = Field(
+        ...,
+        description="Average ETA across all locations"
+    )
+    calculated_at: datetime = Field(
+        ...,
+        description="Timestamp when batch calculation was performed"
     )

@@ -1,0 +1,206 @@
+"""Smart departure alerts — get notified N minutes before you need to leave."""
+
+import logging
+import uuid
+from datetime import datetime, timezone
+from typing import Annotated, List, Optional
+from zoneinfo import ZoneInfo
+
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models.alert import DepartureAlert
+from app.models.user import User
+from app.services.auth_service import get_current_user
+
+router = APIRouter(prefix="/alerts/departure", tags=["Departure Alerts"])
+logger = logging.getLogger(__name__)
+
+_DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+_IST = ZoneInfo("Asia/Kolkata")
+
+
+def _to_ist(dt: datetime) -> str:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(_IST).isoformat()
+
+
+class AlertCreate(BaseModel):
+    route_name: str = Field(..., min_length=2, max_length=100, description="Label for this alert e.g. 'Morning Commute'")
+    origin_name: str = Field(..., min_length=2, max_length=200)
+    destination_name: str = Field(..., min_length=2, max_length=200)
+    departure_time: str = Field(..., description="HH:MM — when you plan to leave, e.g. '08:30'")
+    days_of_week: List[int] = Field(
+        ..., description="0=Monday … 6=Sunday. e.g. [0,1,2,3,4] for Mon–Fri"
+    )
+    advance_notice_minutes: int = Field(30, ge=5, le=120, description="How many minutes before departure to alert")
+    mode: str = Field("driving", description="driving / walking / transit")
+    distance_km: Optional[float] = Field(None, gt=0, le=500)
+
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "route_name": "Morning Commute",
+            "origin_name": "Gachibowli",
+            "destination_name": "Hitech City",
+            "departure_time": "08:30",
+            "days_of_week": [0, 1, 2, 3, 4],
+            "advance_notice_minutes": 30,
+            "mode": "driving",
+            "distance_km": 7.5,
+        }
+    })
+
+    @field_validator("departure_time")
+    @classmethod
+    def validate_time(cls, v):
+        try:
+            datetime.strptime(v, "%H:%M")
+        except ValueError:
+            raise ValueError("departure_time must be HH:MM, e.g. 08:30")
+        return v
+
+    @field_validator("days_of_week")
+    @classmethod
+    def validate_days(cls, v):
+        if not v or not all(0 <= d <= 6 for d in v):
+            raise ValueError("days_of_week must be a non-empty list of integers 0–6")
+        return list(set(v))
+
+    @field_validator("mode")
+    @classmethod
+    def validate_mode(cls, v):
+        if v not in {"driving", "walking", "transit"}:
+            raise ValueError("mode must be driving, walking, or transit")
+        return v
+
+
+def _fmt_alert(a: DepartureAlert) -> dict:
+    days = [_DAY_NAMES[int(d)] for d in a.days_of_week.split(",") if d]
+    result = {
+        "id":                     a.id,
+        "route_name":             a.route_name,
+        "origin":                 a.origin_name,
+        "destination":            a.destination_name,
+        "departure_time":         a.departure_time,
+        "days":                   days,
+        "advance_notice_minutes": a.advance_notice_minutes,
+        "mode":                   a.mode,
+        "distance_km":            a.distance_km,
+        "is_active":              a.is_active,
+        "created_at":             _to_ist(a.created_at),
+    }
+    if a.last_triggered_at is not None:
+        result["last_triggered_at"] = _to_ist(a.last_triggered_at)
+    return result
+
+
+@router.post("/", status_code=status.HTTP_201_CREATED)
+def create_alert(
+    payload: AlertCreate,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+) -> dict:
+    """Create a departure time alert.
+
+    The background task will send you a WebSocket notification
+    `advance_notice_minutes` before your scheduled departure on the configured days.
+    """
+    # Prevent duplicate alerts: same route_name + departure_time per user
+    existing = db.query(DepartureAlert).filter(
+        DepartureAlert.user_id == current_user.id,
+        DepartureAlert.route_name == payload.route_name,
+        DepartureAlert.departure_time == payload.departure_time,
+    ).first()
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"An alert named '{payload.route_name}' at {payload.departure_time} already exists. "
+                f"Delete or update the existing alert (id: {existing.id})."
+            ),
+        )
+
+    days_str = ",".join(str(d) for d in sorted(payload.days_of_week))
+    alert = DepartureAlert(
+        user_id=current_user.id,
+        route_name=payload.route_name,
+        origin_name=payload.origin_name,
+        destination_name=payload.destination_name,
+        departure_time=payload.departure_time,
+        days_of_week=days_str,
+        advance_notice_minutes=payload.advance_notice_minutes,
+        mode=payload.mode,
+        distance_km=payload.distance_km,
+    )
+    db.add(alert)
+    db.commit()
+    db.refresh(alert)
+    logger.info("User %s created departure alert '%s' at %s", current_user.id, payload.route_name, payload.departure_time)
+    return {
+        **_fmt_alert(alert),
+        "message": f"Alert set — you'll be notified {payload.advance_notice_minutes} min before {payload.departure_time}",
+    }
+
+
+@router.get("/", status_code=status.HTTP_200_OK)
+def list_alerts(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+    active_only: bool = Query(False, description="Return only enabled alerts"),
+) -> dict:
+    """List all departure alerts for the current user."""
+    query = db.query(DepartureAlert).filter(DepartureAlert.user_id == current_user.id)
+    if active_only:
+        query = query.filter(DepartureAlert.is_active.is_(True))
+    alerts = query.order_by(DepartureAlert.departure_time.asc()).all()
+    return {"total": len(alerts), "alerts": [_fmt_alert(a) for a in alerts]}
+
+
+@router.patch("/{alert_id}/toggle", status_code=status.HTTP_200_OK)
+def toggle_alert(
+    alert_id: uuid.UUID = Path(..., description="Alert UUID — from `GET /api/v1/alerts/departure/`"),
+    current_user: Annotated[User, Depends(get_current_user)] = None,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Enable or disable a departure alert without deleting it."""
+    alert = db.query(DepartureAlert).filter(
+        DepartureAlert.id == alert_id,
+        DepartureAlert.user_id == current_user.id,
+    ).first()
+    if not alert:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Alert not found")
+    alert.is_active = not alert.is_active
+    db.commit()
+    state = "enabled" if alert.is_active else "disabled"
+    logger.info("User %s %s departure alert %s", current_user.id, state, alert_id)
+    return {
+        "id":           alert_id,
+        "route_name":   alert.route_name,
+        "departure_time": alert.departure_time,
+        "is_active":    alert.is_active,
+        "message":      f"Alert '{alert.route_name}' {state}",
+    }
+
+
+@router.delete("/{alert_id}", status_code=status.HTTP_200_OK)
+def delete_alert(
+    alert_id: uuid.UUID = Path(..., description="Alert UUID — from `GET /api/v1/alerts/departure/`"),
+    current_user: Annotated[User, Depends(get_current_user)] = None,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Permanently delete a departure alert."""
+    alert = db.query(DepartureAlert).filter(
+        DepartureAlert.id == alert_id,
+        DepartureAlert.user_id == current_user.id,
+    ).first()
+    if not alert:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Alert not found")
+    db.delete(alert)
+    db.commit()
+    logger.info("User %s deleted departure alert %s", current_user.id, alert_id)
+    return {"message": "Alert deleted", "id": alert_id}

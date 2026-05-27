@@ -4,6 +4,7 @@ Notification schemas for push notification endpoints.
 Defines request and response models for creating, retrieving, and managing notifications.
 """
 
+import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -18,9 +19,8 @@ class NotificationCreate(BaseModel):
     """Request schema for creating a new notification."""
 
     user_id: int = Field(..., gt=0, description="User ID to receive the notification")
-    route_id: Optional[int] = Field(
+    route_id: Optional[uuid.UUID] = Field(
         None,
-        ge=0,
         description="Optional saved route ID associated with the notification",
     )
     title: str = Field(
@@ -82,14 +82,14 @@ class NotificationCreate(BaseModel):
 class NotificationResponse(BaseModel):
     """Response schema for a notification record."""
 
-    id: int
-    user_id: int
-    route_id: Optional[int] = None
+    id: uuid.UUID
+    user_id: uuid.UUID          # UUID — matches Notification.user_id column
+    route_id: Optional[uuid.UUID] = None
     title: str
     message: str
     notification_type: str
     severity: str
-    location: str
+    location: Optional[str] = None
     is_read: bool
     is_sent: bool
     sent_via: Optional[str] = None
@@ -98,36 +98,20 @@ class NotificationResponse(BaseModel):
 
     model_config = ConfigDict(
         from_attributes=True,
-        extra="forbid",
+        extra="ignore",         # ignore extra DB columns instead of raising
     )
 
 
 class NotificationSummary(BaseModel):
     """Paginated notification response with summary statistics."""
 
-    total: int = Field(
-        ...,
-        ge=0,
-        description="Total number of notifications for the user",
-    )
-    unread: int = Field(
-        ...,
-        ge=0,
-        description="Count of unread notifications",
-    )
-    critical: int = Field(
-        ...,
-        ge=0,
-        description="Count of critical severity notifications",
-    )
-    notifications: List[NotificationResponse] = Field(
-        ...,
-        description="Paginated list of notification records",
-    )
+    total: int = Field(..., ge=0, description="Total notifications for this user (all, unfiltered)")
+    unread: int = Field(..., ge=0, description="Count of unread notifications")
+    critical: int = Field(..., ge=0, description="Count of critical severity notifications")
+    page_total: int = Field(..., ge=0, description="Total matching current filter (before pagination)")
+    notifications: List[NotificationResponse] = Field(..., description="Paginated list of notification records")
 
-    model_config = ConfigDict(
-        extra="forbid",
-    )
+    model_config = ConfigDict(extra="ignore")
 
 
 class WebSocketMessage(BaseModel):

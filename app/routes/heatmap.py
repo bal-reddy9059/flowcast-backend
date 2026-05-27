@@ -5,9 +5,8 @@ Provides public endpoints for heatmap points, congestion hotspots, and
 city-wide summary statistics without requiring authentication.
 """
 
-import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -20,7 +19,7 @@ from app.schemas.heatmap import HeatmapPoint, HeatmapResponse
 from app.services.heatmap_service import (
     calculate_intensity,
     get_heatmap_data,
-    get_hyderabad_hotspots,
+    get_india_hotspots,
 )
 
 router = APIRouter(tags=["Traffic Heatmap"])
@@ -65,7 +64,7 @@ async def get_heatmap(
             detail="congestion_filter must be low, medium, or high",
         )
 
-    response = await get_heatmap_data(
+    response = get_heatmap_data(
         hours=hours,
         congestion_filter=congestion_filter,
         min_intensity=min_intensity,
@@ -87,20 +86,20 @@ async def get_heatmap(
 
 @router.get(
     "/traffic/heatmap/hotspots",
-    response_model=List[HeatmapPoint],
     status_code=status.HTTP_200_OK,
 )
-async def get_heatmap_hotspots(db: Session = Depends(get_db)) -> List[HeatmapPoint]:
+async def get_heatmap_hotspots(
+    limit: int = Query(10, ge=1, le=50, description="Number of top hotspots to return"),
+    db: Session = Depends(get_db),
+) -> dict:
     """
-    Get top 10 highest congestion hotspot locations in Hyderabad right now.
+    Get the top N highest congestion hotspot locations across India right now.
 
-    This endpoint returns the most intense traffic points for the last hour.
+    Returns the most intense traffic points from the last hour, ranked by intensity.
     """
-    hotspots = await get_hyderabad_hotspots(db)
-
-    logger.info("Hotspots endpoint returned %s points", len(hotspots))
-
-    return hotspots
+    result = get_india_hotspots(db, limit=limit)
+    logger.info("Hotspots endpoint returned %s / %s points", result["returned"], result["total_evaluated"])
+    return result
 
 
 @router.get(
@@ -109,11 +108,12 @@ async def get_heatmap_hotspots(db: Session = Depends(get_db)) -> List[HeatmapPoi
 )
 async def get_heatmap_summary(db: Session = Depends(get_db)) -> dict:
     """
-    Get city-wide traffic summary for Hyderabad dashboard.
+    Get India-wide traffic summary for the heatmap dashboard.
 
-    Computes counts and intensity statistics from the most recent traffic records.
+    Computes counts and intensity statistics from the most recent traffic records
+    across all monitored locations in India.
     """
-    lookback_time = datetime.utcnow() - timedelta(hours=1)
+    lookback_time = datetime.now(timezone.utc) - timedelta(hours=1)
 
     latest_subquery = (
         select(
@@ -134,8 +134,7 @@ async def get_heatmap_summary(db: Session = Depends(get_db)) -> dict:
         )
     )
 
-    result = await asyncio.to_thread(lambda: db.execute(statement).scalars().all())
-    records = result or []
+    records = db.execute(statement).scalars().all()
 
     intensities = []
     for record in records:
@@ -180,17 +179,32 @@ async def get_heatmap_summary(db: Session = Depends(get_db)) -> dict:
         low_congestion_locations,
     )
 
+    from app.services.heatmap_service import COVERAGE_AREA
+    from zoneinfo import ZoneInfo
+    _IST = ZoneInfo("Asia/Kolkata")
+
+    def _to_ist(dt):
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(_IST).isoformat()
+
     return {
+        "coverage_area": COVERAGE_AREA,
         "total_monitored_locations": total_locations,
-        "high_congestion_locations": high_congestion_locations,
-        "medium_congestion_locations": medium_congestion_locations,
-        "low_congestion_locations": low_congestion_locations,
-        "city_average_intensity": average_intensity,
+        "congestion_breakdown": {
+            "high":   high_congestion_locations,
+            "medium": medium_congestion_locations,
+            "low":    low_congestion_locations,
+        },
+        "average_intensity": average_intensity,
         "worst_location": worst_location,
         "worst_intensity": worst_intensity,
         "best_location": best_location,
         "best_intensity": best_intensity,
-        "last_updated": last_updated,
+        "last_updated": _to_ist(last_updated),
+        "generated_at": datetime.now(timezone.utc).astimezone(_IST).isoformat(),
     }
 
 

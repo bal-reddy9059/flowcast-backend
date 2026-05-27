@@ -5,9 +5,11 @@ Defines the User table for storing user credentials, profile information,
 and authentication status. Includes email indexing for fast lookups.
 """
 
+import uuid
 from datetime import datetime
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, Index
-from sqlalchemy.sql import func
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import relationship
 
 from app.database import Base
 
@@ -23,32 +25,32 @@ class User(Base):
     __tablename__ = "users"
 
     # Primary Key
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
 
     # Authentication Fields
     email = Column(String(255), unique=True, nullable=False, index=True)
-    hashed_password = Column(String(255), nullable=False)
+    hashed_password = Column(String(255), nullable=True)   # nullable for Google-only accounts
+    auth_provider = Column(String(20), default="local", nullable=False)  # local / google
+    google_id = Column(String(255), nullable=True, unique=True, index=True)
 
     # Profile Fields
-    full_name = Column(String(255), nullable=False)
+    full_name = Column(String(100), nullable=False)
+    picture_url = Column(String(500), nullable=True)
 
     # Status Fields
     is_active = Column(Boolean, default=True, nullable=False, index=True)
     is_admin = Column(Boolean, default=False, nullable=False)
+    is_verified = Column(Boolean, default=False, nullable=False)
+
+    # Activity Fields
+    last_login = Column(DateTime, nullable=True)
 
     # Timestamp Fields
-    created_at = Column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        nullable=False,
-        index=True,
-    )
-    updated_at = Column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        onupdate=func.now(),
-        nullable=False,
-    )
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    saved_routes = relationship("SavedRoute", back_populates="user", cascade="all, delete-orphan")
+    notifications = relationship("Notification", back_populates="user", cascade="all, delete-orphan")
 
     # Composite Index for active user email lookups
     __table_args__ = (
