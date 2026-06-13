@@ -70,10 +70,15 @@ class Incident(Base):
     location = Column(String(255), nullable=False, index=True)
     latitude = Column(Float, nullable=True)
     longitude = Column(Float, nullable=True)
-    incident_type = Column(String(100), nullable=False)   # accident / roadwork / closure / event
+    incident_type = Column(String(100), nullable=False)   # accident / roadwork / closure / event / flooding / police
     severity = Column(String(50), nullable=True)          # minor / moderate / severe
     description = Column(Text, nullable=True)
     reported_at = Column(DateTime(timezone=True), server_default=func.now())
     resolved_at = Column(DateTime(timezone=True), nullable=True)
     is_active = Column(Boolean, default=True, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    # Crowdsourcing fields (added via run_column_migrations)
+    reported_by = Column(String(36), nullable=True, index=True)   # user UUID
+    upvotes = Column(Integer, default=0, nullable=False)
+    downvotes = Column(Integer, default=0, nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=True)   # auto-resolve time

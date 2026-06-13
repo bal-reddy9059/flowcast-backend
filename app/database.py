@@ -257,12 +257,14 @@ def seed_admin_user() -> None:
 
 
 def run_column_migrations():
-    """Add UUID columns to existing tables and backfill NULLs.
+    """Add new columns to existing tables. Safe to run on every startup.
 
-    Safe to run on every startup — ADD COLUMN IF NOT EXISTS is a no-op
-    when the column already exists.
+    ADD COLUMN IF NOT EXISTS is a no-op when the column already exists.
+    UUID columns are backfilled with gen_random_uuid(); other columns keep
+    their DEFAULT values and are not overwritten.
     """
-    migrations = [
+    # (table, column, postgres_type)
+    all_columns = [
         ("traffic_records",    "record_uuid",    "VARCHAR(36)"),
         ("prediction_results", "prediction_uuid", "VARCHAR(36)"),
         ("incidents",          "incident_uuid",   "VARCHAR(36)"),
@@ -270,17 +272,31 @@ def run_column_migrations():
         ("users", "auth_provider", "VARCHAR(20) DEFAULT 'local' NOT NULL"),
         ("users", "google_id",     "VARCHAR(255)"),
         ("users", "picture_url",   "VARCHAR(500)"),
+        # Crowdsourced incident columns
+        ("incidents", "reported_by", "VARCHAR(36)"),
+        ("incidents", "upvotes",     "INTEGER DEFAULT 0 NOT NULL"),
+        ("incidents", "downvotes",   "INTEGER DEFAULT 0 NOT NULL"),
+        ("incidents", "expires_at",  "TIMESTAMPTZ"),
+        # Webhook name label
+        ("webhooks",  "name",        "VARCHAR(200)"),
     ]
+    # Only these columns need a UUID backfill
+    uuid_cols = {
+        ("traffic_records",    "record_uuid"),
+        ("prediction_results", "prediction_uuid"),
+        ("incidents",          "incident_uuid"),
+    }
     try:
         with engine.begin() as conn:
-            for table, col, dtype in migrations:
+            for table, col, dtype in all_columns:
                 conn.execute(text(
                     f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {dtype}"
                 ))
-            for table, col, _ in migrations:
-                conn.execute(text(
-                    f"UPDATE {table} SET {col} = gen_random_uuid()::text WHERE {col} IS NULL"
-                ))
-        print("[OK] Column migrations applied (UUID columns ready)")
+            for table, col, _ in all_columns:
+                if (table, col) in uuid_cols:
+                    conn.execute(text(
+                        f"UPDATE {table} SET {col} = gen_random_uuid()::text WHERE {col} IS NULL"
+                    ))
+        print("[OK] Column migrations applied")
     except Exception as e:
         print(f"[WARN] Column migration skipped: {e}")

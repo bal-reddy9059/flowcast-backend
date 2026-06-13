@@ -2,6 +2,7 @@
 ETA calculation endpoints for FlowCast.
 
 Provides public routes for single and batch ETA queries and monitored location discovery.
+Results are cached in Redis for 60 seconds to reduce DB load.
 """
 
 import logging
@@ -15,6 +16,7 @@ from app.database import get_db
 from app.models.predictor import TrafficRecord
 from app.schemas.eta import ETAResponse, ETABatchRequest, ETABatchResponse
 from app.services.eta_service import calculate_eta_for_location
+from app.services.cache_service import get_cache, set_cache
 
 router = APIRouter(tags=["ETA Calculation"])
 
@@ -22,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 ALLOWED_ETA_MODES = {"driving", "walking", "transit"}
 _ALL_MODES = ["driving", "walking", "transit"]
+_ETA_CACHE_TTL = 60  # seconds
 
 
 @router.get(
@@ -29,7 +32,7 @@ _ALL_MODES = ["driving", "walking", "transit"]
     response_model=ETAResponse,
     status_code=status.HTTP_200_OK,
 )
-def get_eta(
+async def get_eta(
     location: str = Query(..., min_length=2, description="Hyderabad location name"),
     distance_km: float = Query(
         ..., gt=0, le=500, description="Distance to travel in kilometers"
@@ -37,7 +40,7 @@ def get_eta(
     mode: str = Query("driving", description="Travel mode"),
     db: Session = Depends(get_db),
 ) -> ETAResponse:
-    """Calculate real-time ETA for a Hyderabad location."""
+    """Calculate real-time ETA for a Hyderabad location. Cached 60 s in Redis."""
     normalized_location = location.strip()
     if len(normalized_location) < 2:
         raise HTTPException(
@@ -50,13 +53,16 @@ def get_eta(
             detail="mode must be driving, walking or transit",
         )
 
-    logger.info("ETA requested for %s", normalized_location)
-    return calculate_eta_for_location(
-        normalized_location,
-        distance_km,
-        mode,
-        db,
-    )
+    cache_key = f"eta:{normalized_location}:{distance_km}:{mode}"
+    cached = await get_cache(cache_key)
+    if cached:
+        logger.debug("ETA cache HIT for %s", cache_key)
+        return ETAResponse(**cached)
+
+    logger.info("ETA requested for %s (cache MISS)", normalized_location)
+    result = calculate_eta_for_location(normalized_location, distance_km, mode, db)
+    await set_cache(cache_key, result.model_dump(mode="json"), ttl=_ETA_CACHE_TTL)
+    return result
 
 
 @router.post(

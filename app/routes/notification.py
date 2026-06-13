@@ -33,7 +33,7 @@ WEBSOCKET_KEEPALIVE_INTERVAL = 30
 
 
 @router.websocket("/ws/{user_id}")
-async def websocket_notifications_endpoint(websocket: WebSocket, user_id: int) -> None:
+async def websocket_notifications_endpoint(websocket: WebSocket, user_id: str) -> None:
     """
     WebSocket endpoint for real-time push notifications.
 

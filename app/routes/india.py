@@ -317,31 +317,42 @@ def india_hotspots(
     limit: int = Query(10, ge=1, le=50, description="Number of worst locations to return"),
     db: Session = Depends(get_db),
 ) -> dict:
-    """Top N most congested locations across India right now."""
-    now   = datetime.now(timezone.utc)
-    since = now - timedelta(hours=1)
+    """Top N most congested locations across India right now.
+
+    Falls back to a 6-hour window when the last 2 hours have no data (e.g. fresh server start).
+    """
+    now = datetime.now(timezone.utc)
     results = []
 
     for loc in INDIA_LOCATIONS:
-        recs = (
-            db.query(TrafficRecord)
-            .filter(
-                TrafficRecord.location == loc["name"],
-                TrafficRecord.created_at >= since,
+        # Try 2-hour window first; fall back to 6 hours so fresh instances still return data
+        recs = None
+        for window_hours in (2, 6):
+            since = now - timedelta(hours=window_hours)
+            recs = (
+                db.query(TrafficRecord)
+                .filter(
+                    TrafficRecord.location == loc["name"],
+                    TrafficRecord.created_at >= since,
+                )
+                .order_by(TrafficRecord.created_at.desc())
+                .limit(3)
+                .all()
             )
-            .order_by(TrafficRecord.created_at.desc())
-            .limit(3)
-            .all()
-        )
+            if recs:
+                break
+
         if not recs:
             continue
         latest = recs[0]
-        score  = _CONGESTION_SCORE.get(latest.congestion_level or "low", 0)
+        speeds = [r.average_speed for r in recs if r.average_speed]
+        avg_speed = sum(speeds) / len(speeds) if speeds else latest.average_speed
+        score = _CONGESTION_SCORE.get(latest.congestion_level or "low", 0)
         results.append({
             "location": loc["name"], "city": loc["city"], "state": loc["state"],
             "lat": loc["lat"], "lng": loc["lng"],
-            "congestion_level": latest.congestion_level,
-            "avg_speed_kmh": latest.average_speed,
+            "congestion_level": latest.congestion_level or "low",
+            "avg_speed_kmh": round(avg_speed, 1) if avg_speed else None,
             "vehicle_count": latest.vehicle_count,
             "_score": score,
         })
@@ -350,9 +361,11 @@ def india_hotspots(
     for r in results:
         r.pop("_score", None)
 
+    top = results[:limit]
     return {
         "total_evaluated": len(results),
-        "top_congested": results[:limit],
+        "hotspots": top,          # primary key (frontend-friendly)
+        "top_congested": top,     # backward-compat alias
         "generated_at": now.isoformat(),
     }
 

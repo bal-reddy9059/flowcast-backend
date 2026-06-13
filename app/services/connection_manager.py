@@ -25,9 +25,9 @@ class ConnectionManager:
 
     def __init__(self) -> None:
         """Initialize the connection manager with an empty connections dictionary."""
-        self.active_connections: Dict[int, WebSocket] = {}
+        self.active_connections: Dict[str, WebSocket] = {}
 
-    async def connect(self, user_id: int, websocket: WebSocket) -> None:
+    async def connect(self, user_id: str, websocket: WebSocket) -> None:
         """
         Accept and register a new WebSocket connection for a user.
 
@@ -57,7 +57,7 @@ class ConnectionManager:
             len(self.active_connections),
         )
 
-    def disconnect(self, user_id: int) -> None:
+    def disconnect(self, user_id: str) -> None:
         """
         Remove a user's WebSocket connection from active connections.
 
@@ -76,7 +76,7 @@ class ConnectionManager:
                 len(self.active_connections),
             )
 
-    async def send_to_user(self, user_id: int, message: dict) -> bool:
+    async def send_to_user(self, user_id: str, message: dict) -> bool:
         """
         Send a message to a specific connected user.
 
@@ -129,7 +129,7 @@ class ConnectionManager:
         Returns:
             None
         """
-        disconnected_users: List[int] = []
+        disconnected_users: List[str] = []
 
         # Copy keys to avoid modifying dict during iteration
         user_ids = list(self.active_connections.keys())
@@ -161,7 +161,7 @@ class ConnectionManager:
             len(disconnected_users),
         )
 
-    def get_connected_users(self) -> List[int]:
+    def get_connected_users(self) -> List[str]:
         """
         Retrieve list of all currently connected user IDs.
 
@@ -185,7 +185,7 @@ class ConnectionManager:
         """
         return len(self.active_connections)
 
-    async def send_ping(self, user_id: int) -> bool:
+    async def send_ping(self, user_id: str) -> bool:
         """
         Send a keepalive ping message to a connected user.
 

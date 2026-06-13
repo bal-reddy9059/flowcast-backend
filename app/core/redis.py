@@ -1,49 +1,59 @@
-import os
 import logging
-from typing import Optional
+import os
+from typing import Any, Optional
 
-import aioredis
+try:
+    import redis.asyncio as aioredis
+    _REDIS_AVAILABLE = True
+except ImportError:
+    aioredis = None          # type: ignore[assignment]
+    _REDIS_AVAILABLE = False
 
-# Module-level Redis client instance
-redis_client: Optional[aioredis.Redis] = None
+# Module-level client — None means caching is disabled
+redis_client: Optional[Any] = None
 
 
 async def init_redis() -> None:
     """
-    Initialize Redis connection pool.
+    Initialize the async Redis connection pool.
 
-    Creates an async Redis client with connection pooling.
-    Verifies connection with a ping. If Redis is unavailable,
-    logs a warning and sets redis_client to None (caching disabled).
+    Uses redis.asyncio (redis-py >= 4.2). Falls back gracefully — sets
+    redis_client to None so cache_service no-ops instead of crashing.
     """
     global redis_client
-    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
 
+    if not _REDIS_AVAILABLE:
+        logging.warning("redis package not installed — caching disabled")
+        return
+
+    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
     try:
-        redis_client = aioredis.from_url(redis_url, max_connections=10)
-        await redis_client.ping()
-        logging.info("Redis connected successfully")
-    except Exception as e:
-        logging.warning(f"Redis unavailable — caching disabled: {e}")
+        client = aioredis.from_url(
+            redis_url,
+            encoding="utf-8",
+            decode_responses=True,
+            max_connections=10,
+        )
+        await client.ping()
+        redis_client = client
+        logging.info("Redis connected: %s", redis_url)
+    except Exception as exc:
+        logging.warning("Redis unavailable — caching disabled: %s", exc)
         redis_client = None
 
 
-async def get_redis_client() -> Optional[aioredis.Redis]:
-    """
-    Return the Redis client instance.
-
-    Used as a FastAPI dependency to inject Redis client.
-    Returns None if Redis is unavailable.
-    """
+async def get_redis_client() -> Optional[Any]:
+    """Return the active Redis client, or None if unavailable."""
     return redis_client
 
 
 async def close_redis() -> None:
-    """
-    Close the Redis connection pool.
-
-    Called during app shutdown to clean up resources.
-    """
-    if redis_client:
-        await redis_client.close()
+    """Close the Redis connection pool on shutdown."""
+    global redis_client
+    if redis_client is not None:
+        try:
+            await redis_client.aclose()
+        except Exception:
+            pass
+        redis_client = None
         logging.info("Redis connection closed")

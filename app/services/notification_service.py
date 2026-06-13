@@ -90,26 +90,26 @@ async def create_notification(
 
 
 async def send_websocket_notification(
-    user_id: int,
+    user_id: str,
     notification: Notification,
     manager: Any,
     db: Session,
 ) -> bool:
     """
-    Send notification to user via WebSocket and update delivery status.
+    Send notification to user via WebSocket (and email if the user opted in).
 
-    Args:
-        user_id: ID of the user to send notification to
-        notification: Notification object to send
-        manager: ConnectionManager instance managing WebSocket connections
-        db: Database session
-
-    Returns:
-        True if notification sent successfully, False if user not connected
-
-    Raises:
-        Exception: If database update fails
+    Checks UserPreferences for notify_email. If True and SMTP is configured,
+    also dispatches an HTML email. WebSocket delivery happens regardless.
     """
+    from app.models.preferences import UserPreferences
+    from app.models.user import User
+    from app.services.email_service import (
+        smtp_configured, send_congestion_alert,
+        send_departure_alert, send_report_ready, send_generic_notification,
+    )
+
+    # ── 1. WebSocket delivery ─────────────────────────────────────────────────
+    ws_sent = False
     try:
         payload = WebSocketMessage(
             type="notification",
@@ -123,37 +123,59 @@ async def send_websocket_notification(
                 "created_at": notification.created_at.isoformat(),
             },
         )
-
         await manager.send_to_user(user_id, payload.model_dump(mode="json"))
-
-        notification.is_sent = True
-        notification.sent_via = "websocket"
-        db.commit()
-
-        logger.info(
-            "WebSocket notification sent to user %s (notification_id: %s)",
-            user_id,
-            notification.id,
-        )
-
-        return True
-
+        ws_sent = True
+        logger.info("WebSocket notification sent to user %s (id: %s)", user_id, notification.id)
     except KeyError:
-        notification.is_sent = False
+        logger.warning("User %s not connected — WS notification %s not delivered", user_id, notification.id)
+    except Exception as error:
+        logger.error("WS notification error for user %s: %s", user_id, error)
+
+    # ── 2. Email delivery (if opted in) ──────────────────────────────────────
+    email_sent = False
+    if smtp_configured():
+        try:
+            import uuid as _uuid
+            uid = _uuid.UUID(str(user_id)) if not isinstance(user_id, _uuid.UUID) else user_id
+            prefs = db.query(UserPreferences).filter(UserPreferences.user_id == uid).first()
+            if prefs and prefs.notify_email:
+                user = db.query(User).filter(User.id == uid).first()
+                if user and user.email:
+                    ntype = notification.notification_type or ""
+                    if "congestion" in ntype or "zone" in ntype or "rule" in ntype:
+                        email_sent = await send_congestion_alert(
+                            user.email, notification.title, notification.message,
+                            notification.location or "", notification.severity or "medium",
+                        )
+                    elif "departure" in ntype:
+                        email_sent = await send_departure_alert(
+                            user.email, notification.title, notification.message,
+                            notification.location or "",
+                        )
+                    elif "system" in ntype or "report" in ntype:
+                        email_sent = await send_report_ready(
+                            user.email, notification.title, notification.message,
+                        )
+                    else:
+                        email_sent = await send_generic_notification(
+                            user.email, notification.title, notification.message,
+                        )
+        except Exception as exc:
+            logger.warning("Email delivery error for user %s: %s", user_id, exc)
+
+    # ── 3. Persist delivery status ────────────────────────────────────────────
+    try:
+        notification.is_sent = ws_sent or email_sent
+        channels = []
+        if ws_sent:    channels.append("websocket")
+        if email_sent: channels.append("email")
+        notification.sent_via = ",".join(channels) if channels else "none"
         db.commit()
-
-        logger.warning(
-            "User %s not connected — notification %s queued for retry",
-            user_id,
-            notification.id,
-        )
-
-        return False
-
     except Exception as error:
         db.rollback()
-        logger.error("Failed to send WebSocket notification to user %s: %s", user_id, error)
-        return False
+        logger.error("Failed to update notification delivery status: %s", error)
+
+    return ws_sent or email_sent
 
 
 async def check_saved_routes_for_congestion(db: Session, manager: Any) -> None:
@@ -236,7 +258,7 @@ async def check_saved_routes_for_congestion(db: Session, manager: Any) -> None:
                 )
 
                 sent = await send_websocket_notification(
-                    user_id=route.user_id,
+                    user_id=str(route.user_id),
                     notification=notification,
                     manager=manager,
                     db=db,

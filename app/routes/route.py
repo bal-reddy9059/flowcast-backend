@@ -64,10 +64,10 @@ def validate_coordinates(lat: float, lng: float) -> None:
 
 @router.get("/optimize", response_model=RouteResponse)
 async def optimize_route(
-    origin_lat: float = Query(..., ge=6.0, le=37.5, description="Origin latitude (India: 6.0–37.5)", example=17.4401),
-    origin_lng: float = Query(..., ge=68.0, le=97.5, description="Origin longitude (India: 68.0–97.5)", example=78.3489),
-    destination_lat: float = Query(..., ge=6.0, le=37.5, description="Destination latitude (India: 6.0–37.5)", example=17.4486),
-    destination_lng: float = Query(..., ge=68.0, le=97.5, description="Destination longitude (India: 68.0–97.5)", example=78.3908),
+    origin_lat: float = Query(..., ge=6.0, le=37.5, description="Origin latitude (India: 6.0–37.5)"),
+    origin_lng: float = Query(..., ge=68.0, le=97.5, description="Origin longitude (India: 68.0–97.5)"),
+    destination_lat: float = Query(..., ge=6.0, le=37.5, description="Destination latitude (India: 6.0–37.5)"),
+    destination_lng: float = Query(..., ge=68.0, le=97.5, description="Destination longitude (India: 68.0–97.5)"),
     mode: str = Query("driving", description="Travel mode"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -196,7 +196,7 @@ def get_route_report(
     route_id: uuid.UUID = Path(
         ...,
         description="Saved route ID — get this from `GET /api/v1/routes/saved` (copy any `id`)",
-        example="550e8400-e29b-41d4-a716-446655440000",
+        openapi_examples={"default": {"value": "550e8400-e29b-41d4-a716-446655440000"}},
     ),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -295,7 +295,7 @@ def create_share_link(
     route_id: uuid.UUID = Path(
         ...,
         description="Saved route ID — get this from `GET /api/v1/routes/saved` (copy any `id`)",
-        example="550e8400-e29b-41d4-a716-446655440000",
+        openapi_examples={"default": {"value": "550e8400-e29b-41d4-a716-446655440000"}},
     ),
     expires_days: Optional[int] = Query(7, ge=1, le=90, description="Link expiry in days. Omit for no expiry."),
     current_user: User = Depends(get_current_user),
@@ -342,7 +342,7 @@ def view_shared_route(
     token: str = Path(
         ...,
         description="Share token — returned by `POST /api/v1/routes/saved/{route_id}/share` (copy the `token` field)",
-        example="abc123xyz",
+        openapi_examples={"default": {"value": "abc123xyz"}},
     ),
     db: Session = Depends(get_db),
 ) -> dict:
@@ -379,7 +379,7 @@ async def delete_saved_route(
     route_id: uuid.UUID = Path(
         ...,
         description="Saved route ID — get this from `GET /api/v1/routes/saved` (copy any `id`)",
-        example="550e8400-e29b-41d4-a716-446655440000",
+        openapi_examples={"default": {"value": "550e8400-e29b-41d4-a716-446655440000"}},
     ),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -408,6 +408,46 @@ async def delete_saved_route(
 
     logger.info("Route %s soft deleted for user %s", route_id, current_user.id)
     return {"message": "Route deleted", "id": route_id}
+
+
+@router.get("/narrative", status_code=status.HTTP_200_OK)
+def route_narrative(
+    origin: str = Query(..., min_length=2, description="Origin location name"),
+    destination: str = Query(..., min_length=2, description="Destination name"),
+    distance_km: float = Query(..., gt=0, le=500, description="Trip distance in km"),
+    mode: str = Query("driving", description="driving / walking / transit"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """AI-generated route briefing in plain English — like a traffic reporter.
+
+    Takes your origin, destination, and distance and returns a 2-3 sentence
+    human-readable summary of current conditions, any delays or incidents,
+    and a departure tip. Much more useful than raw congestion levels.
+
+    **Example output:**
+    "Your 22km drive from Whitefield to MG Road should take about 48 minutes today.
+    Watch out: Silk Board Flyover is showing heavy congestion right now, adding roughly
+    11 minutes. Consider leaving before 5:30pm to beat the peak."
+    """
+    from app.services.eta_service import calculate_eta_for_location
+    from app.services.narrative_service import build_route_narrative
+
+    if mode not in {"driving", "walking", "transit"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="mode must be driving, walking, or transit")
+
+    eta = calculate_eta_for_location(origin, distance_km, mode, db)
+    result = build_route_narrative(
+        origin=origin,
+        destination=destination,
+        distance_km=distance_km,
+        eta_minutes=eta.eta_minutes,
+        congestion_level=eta.congestion_level,
+        avg_speed_kmh=eta.average_speed_kmh,
+        db=db,
+    )
+    logger.info("Route narrative for %s→%s (%.1fkm %s)", origin, destination, distance_km, mode)
+    return result
 
 
 # Test commands (replace <token> with actual JWT token)

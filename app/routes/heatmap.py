@@ -18,13 +18,17 @@ from app.models.predictor import TrafficRecord
 from app.schemas.heatmap import HeatmapPoint, HeatmapResponse
 from app.services.heatmap_service import (
     calculate_intensity,
+    classify_severity,
     get_heatmap_data,
     get_india_hotspots,
 )
+from app.services.cache_service import get_cache, set_cache
 
 router = APIRouter(tags=["Traffic Heatmap"])
 logger = logging.getLogger(__name__)
 ALLOWED_CONGESTION_FILTERS = {"low", "medium", "high"}
+ALLOWED_SEVERITY_FILTERS = {"critical", "high", "moderate", "low"}
+_HEATMAP_CACHE_TTL = 120  # seconds
 
 
 @router.get(
@@ -37,7 +41,7 @@ async def get_heatmap(
     congestion_filter: Optional[str] = Query(
         None,
         description="Optional congestion level filter: low, medium, high",
-        example="high",
+        openapi_examples={"default": {"value": "high"}},
     ),
     min_intensity: float = Query(
         0.0,
@@ -57,12 +61,19 @@ async def get_heatmap(
     Get traffic heatmap data for Google Maps HeatmapLayer visualization.
 
     Returns a list of heatmap points covering Hyderabad traffic locations.
+    Results are cached in Redis for 120 seconds.
     """
     if congestion_filter is not None and congestion_filter not in ALLOWED_CONGESTION_FILTERS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="congestion_filter must be low, medium, or high",
         )
+
+    cache_key = f"heatmap:{hours}:{congestion_filter}:{min_intensity}:{limit}"
+    cached = await get_cache(cache_key)
+    if cached:
+        logger.debug("Heatmap cache HIT for key=%s", cache_key)
+        return HeatmapResponse(**cached)
 
     response = get_heatmap_data(
         hours=hours,
@@ -71,6 +82,8 @@ async def get_heatmap(
         limit=limit,
         db=db,
     )
+
+    await set_cache(cache_key, response.model_dump(mode="json"), ttl=_HEATMAP_CACHE_TTL)
 
     logger.info(
         "Heatmap endpoint returned %s points (hours=%s, filter=%s, min_intensity=%s, limit=%s)",
@@ -90,15 +103,29 @@ async def get_heatmap(
 )
 async def get_heatmap_hotspots(
     limit: int = Query(10, ge=1, le=50, description="Number of top hotspots to return"),
+    severity: Optional[str] = Query(
+        None,
+        description="Filter by severity tier: critical (≥0.8), high (0.6–0.79), moderate (0.4–0.59), low (<0.4)",
+    ),
     db: Session = Depends(get_db),
 ) -> dict:
     """
     Get the top N highest congestion hotspot locations across India right now.
 
     Returns the most intense traffic points from the last hour, ranked by intensity.
+    Each hotspot includes a `severity` field (critical / high / moderate / low).
+    Pass `severity=critical` (or high/moderate/low) to filter by tier.
     """
-    result = get_india_hotspots(db, limit=limit)
-    logger.info("Hotspots endpoint returned %s / %s points", result["returned"], result["total_evaluated"])
+    if severity is not None and severity not in ALLOWED_SEVERITY_FILTERS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"severity must be one of: {', '.join(sorted(ALLOWED_SEVERITY_FILTERS))}",
+        )
+    result = get_india_hotspots(db, limit=limit, severity=severity)
+    logger.info(
+        "Hotspots endpoint returned %s / %s points (severity=%s)",
+        result["returned"], result["total_evaluated"], severity,
+    )
     return result
 
 

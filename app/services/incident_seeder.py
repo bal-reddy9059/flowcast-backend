@@ -148,6 +148,28 @@ _INCIDENT_SEED_AREAS: dict[str, list[tuple]] = {
 }
 
 
+def patch_seeded_incidents(db: Session) -> int:
+    """Backfill reported_by, upvotes, and expires_at on existing system-seeded rows.
+
+    Identifies seeded rows by reported_by IS NULL (user-reported rows always have a UUID).
+    Safe to call multiple times — only updates rows that still need it.
+    """
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    rows = db.query(Incident).filter(Incident.reported_by.is_(None)).all()
+    if not rows:
+        return 0
+    for inc in rows:
+        inc.reported_by = "system"
+        if not inc.upvotes:
+            inc.upvotes = 1
+        if inc.is_active and inc.expires_at is None:
+            base = inc.reported_at or now
+            inc.expires_at = base + timedelta(hours=24)
+    db.commit()
+    return len(rows)
+
+
 def auto_seed_incidents(location: str, db: Session) -> None:
     """Idempotent: insert missing seed incidents for the city that matches location."""
     key = next((k for k in _INCIDENT_SEEDS if k in location.lower()), None)
@@ -162,13 +184,19 @@ def auto_seed_incidents(location: str, db: Session) -> None:
         area_name, lat, lon = areas[i % len(areas)]
         exists = (
             db.query(Incident)
-            .filter(Incident.location == area_name, Incident.incident_type == tmpl["incident_type"])
+            .filter(
+                Incident.location == area_name,
+                Incident.incident_type == tmpl["incident_type"],
+                Incident.is_active == True,
+            )
             .first()
         )
         if exists:
             continue
         resolved_hours = tmpl.get("resolved_hours_ago")
         resolved_at = now - timedelta(hours=resolved_hours) if resolved_hours else None
+        reported_at = now - timedelta(minutes=random.randint(10, 180))
+        is_active = resolved_at is None
         inc = Incident(
             location=area_name,
             latitude=lat,
@@ -176,11 +204,82 @@ def auto_seed_incidents(location: str, db: Session) -> None:
             incident_type=tmpl["incident_type"],
             severity=tmpl["severity"],
             description=tmpl["description"],
-            is_active=resolved_at is None,
+            reported_by="system",
+            upvotes=1,
+            downvotes=0,
+            is_active=is_active,
+            reported_at=reported_at,
             resolved_at=resolved_at,
-            reported_at=now - timedelta(minutes=random.randint(10, 180)),
+            expires_at=reported_at + timedelta(hours=24) if is_active else None,
         )
         db.add(inc)
         added = True
+    if added:
+        db.commit()
+
+
+def seed_week_incidents(location: str, db: Session) -> None:
+    """Create historical incidents spread across the past 7 days.
+
+    One incident template is mapped to each past day so the weekly trend
+    report shows non-zero incident counts. Days that already have at least
+    one incident for the city are skipped (idempotent).
+    """
+    key = next((k for k in _INCIDENT_SEEDS if k in location.lower()), None)
+    if key is None:
+        return
+
+    templates = _INCIDENT_SEEDS[key]
+    areas = _INCIDENT_SEED_AREAS.get(key, [(location, None, None)])
+    now = datetime.now(timezone.utc)
+    added = False
+
+    for days_back in range(1, 7):  # past 6 days (today is handled by auto_seed_incidents)
+        day_start = (now - timedelta(days=days_back)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        day_end = day_start + timedelta(days=1)
+
+        already = (
+            db.query(Incident)
+            .filter(
+                Incident.location.in_([a[0] for a in areas]),
+                Incident.reported_at >= day_start,
+                Incident.reported_at < day_end,
+            )
+            .first()
+        )
+        if already:
+            continue
+
+        # Pick a template for this day (cycle through available templates)
+        tmpl = templates[days_back % len(templates)]
+        area_name, lat, lon = areas[days_back % len(areas)]
+
+        # Spread incidents randomly across daytime hours (7 AM – 9 PM)
+        hour_offset = random.randint(7 * 60, 21 * 60)  # minutes from midnight
+        reported_at = day_start + timedelta(minutes=hour_offset)
+
+        resolved_hours = tmpl.get("resolved_hours_ago")
+        resolved_at = reported_at + timedelta(hours=resolved_hours) if resolved_hours else None
+        is_active = resolved_at is None or resolved_at > now
+
+        db.add(Incident(
+            location=area_name,
+            latitude=lat,
+            longitude=lon,
+            incident_type=tmpl["incident_type"],
+            severity=tmpl["severity"],
+            description=tmpl["description"],
+            reported_by="system",
+            upvotes=1,
+            downvotes=0,
+            is_active=is_active,
+            reported_at=reported_at,
+            resolved_at=resolved_at if not is_active else None,
+            expires_at=reported_at + timedelta(hours=24) if is_active else None,
+        ))
+        added = True
+
     if added:
         db.commit()

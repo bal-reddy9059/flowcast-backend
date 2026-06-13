@@ -140,11 +140,23 @@ def get_heatmap_data(
     )
 
 
-def get_india_hotspots(db: Session, limit: int = 10) -> dict:
+def classify_severity(intensity: float) -> str:
+    """Map a normalised intensity score to a 4-tier severity label."""
+    if intensity >= 0.8:
+        return "critical"
+    if intensity >= 0.6:
+        return "high"
+    if intensity >= 0.4:
+        return "moderate"
+    return "low"
+
+
+def get_india_hotspots(db: Session, limit: int = 10, severity: Optional[str] = None) -> dict:
     """
     Get top N highest intensity traffic hotspots across India.
 
     Uses the last hour of traffic records and returns the most congested locations.
+    Optionally filter by severity tier: critical, high, moderate, low.
     """
     from zoneinfo import ZoneInfo
     _IST = ZoneInfo("Asia/Kolkata")
@@ -153,33 +165,41 @@ def get_india_hotspots(db: Session, limit: int = 10) -> dict:
     query = _latest_records_query(lookback_time)
     records = db.execute(query).scalars().all()
 
-    points: List[HeatmapPoint] = []
+    hotspot_list = []
     for record in records:
         intensity = calculate_intensity(
             vehicle_count=record.vehicle_count or 0,
             average_speed=record.average_speed or 0.0,
             congestion_level=record.congestion_level or "low",
         )
-        points.append(
-            HeatmapPoint(
-                latitude=record.latitude,
-                longitude=record.longitude,
-                intensity=intensity,
-                congestion_level=record.congestion_level,
-                location=record.location,
-                vehicle_count=record.vehicle_count,
-                average_speed=record.average_speed,
-                timestamp=record.timestamp,
-            )
-        )
+        sev = classify_severity(intensity)
+        hotspot_list.append({
+            "latitude": record.latitude,
+            "longitude": record.longitude,
+            "intensity": intensity,
+            "severity": sev,
+            "congestion_level": record.congestion_level,
+            "location": record.location,
+            "vehicle_count": record.vehicle_count,
+            "average_speed": record.average_speed,
+            "timestamp": record.timestamp,
+        })
 
-    points.sort(key=lambda p: p.intensity, reverse=True)
-    hotspots = points[:limit]
+    hotspot_list.sort(key=lambda p: p["intensity"], reverse=True)
 
-    logger.info("Hotspots fetched: %s locations evaluated, returning top %s", len(records), len(hotspots))
+    if severity:
+        hotspot_list = [h for h in hotspot_list if h["severity"] == severity]
+
+    hotspots = hotspot_list[:limit]
+
+    logger.info(
+        "Hotspots fetched: %s locations evaluated, severity_filter=%s, returning %s",
+        len(records), severity, len(hotspots),
+    )
     return {
         "coverage_area":    COVERAGE_AREA,
         "total_evaluated":  len(records),
+        "severity_filter":  severity,
         "returned":         len(hotspots),
         "hotspots":         hotspots,
         "generated_at":     datetime.now(timezone.utc).astimezone(_IST).isoformat(),

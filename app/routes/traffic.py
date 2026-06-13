@@ -230,7 +230,7 @@ def get_record(
     record_id: int = Path(
         ...,
         description="Traffic record ID — get this from `GET /api/v1/traffic/records` (copy any `id` from the response)",
-        example=1,
+        openapi_examples={"default": {"value": 1}},
     ),
     db: Session = Depends(get_db),
 ):
@@ -493,7 +493,7 @@ def resolve_incident(
     incident_id: str = Path(
         ...,
         description="Incident numeric `id` **or** `incident_uuid` — both accepted. Get either value from `GET /api/v1/traffic/incidents`.",
-        example="1",
+        openapi_examples={"default": {"value": "1"}},
     ),
     db: Session = Depends(get_db),
 ):

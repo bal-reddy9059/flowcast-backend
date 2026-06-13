@@ -8,6 +8,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.models.user import User
+from app.services.auth_service import get_current_user
 from app.services.eta_service import calculate_eta_for_location, get_speed_for_congestion
 from app.services.prediction_service import predict_traffic_congestion
 
@@ -206,4 +208,160 @@ def get_commute_score(
             "low_pct": round(counts.get("low", 0) / total * 100, 1),
         },
         "evaluated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@router.get("/stress-score", status_code=status.HTTP_200_OK)
+def get_stress_score(
+    location: str = Query(..., min_length=2, description="Location / route area (e.g. 'Silk Board, Bangalore')"),
+    distance_km: float = Query(10.0, gt=0, le=500, description="Trip distance in km — defaults to 10 km if not provided"),
+    mode: str = Query("driving", description="driving / walking / transit"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Commute stress score (0 = calm, 100 = intense) for current road conditions.
+
+    Only `location` is required — `distance_km` defaults to 10 km and `mode` defaults to driving.
+
+    Measures stress from four factors: duration vs free-flow, active incidents,
+    speed variability (stop-and-go), and overall congestion level.
+    Includes a personal comparison if you have trip history on this route.
+    """
+    from app.services.stress_scorer import calculate_stress_score
+
+    if mode not in {"driving", "walking", "transit"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="mode must be driving, walking, or transit")
+
+    user_id = str(current_user.id) if current_user else None
+    return calculate_stress_score(location, distance_km, mode, db, user_id=user_id)
+
+
+@router.get("/should-i-leave", status_code=status.HTTP_200_OK)
+def should_i_leave(
+    origin: str = Query(..., min_length=2, description="Origin location name"),
+    destination: str = Query(..., min_length=2, description="Destination location name"),
+    distance_km: float = Query(..., gt=0, le=500, description="Trip distance in km"),
+    mode: str = Query("driving", description="Travel mode: driving / walking / transit"),
+    target_arrival: str = Query(None, description="Optional ISO-8601 target arrival time"),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Smart departure advisor — answers 'Should I leave NOW or wait?'
+
+    Compares current traffic conditions against the next 6-hour congestion forecast
+    and returns a plain-language recommendation with estimated time savings.
+
+    **Advice values:**
+    - `leave_now` — current conditions are optimal or won't improve
+    - `wait_N_minutes` — waiting N minutes (60 / 120 / 180) saves meaningful time
+    - `already_late` — you must leave immediately to reach `target_arrival`
+    """
+    if mode not in {"driving", "walking", "transit"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="mode must be driving, walking, or transit",
+        )
+
+    now = datetime.now(timezone.utc)
+
+    # Parse optional target arrival
+    target_dt = None
+    if target_arrival:
+        try:
+            from datetime import datetime as _dt
+            target_dt = _dt.fromisoformat(target_arrival)
+            if target_dt.tzinfo is None:
+                target_dt = target_dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="target_arrival must be a valid ISO-8601 datetime string",
+            )
+
+    # Current ETA
+    current_eta = calculate_eta_for_location(origin, distance_km, mode, db)
+    current_eta_min = current_eta.eta_minutes
+    current_congestion = current_eta.congestion_level
+
+    # Must-leave check
+    if target_dt is not None:
+        must_leave_by = target_dt - timedelta(minutes=current_eta_min)
+        if now >= must_leave_by:
+            logger.info("should-i-leave: already_late for %s→%s", origin, destination)
+            return {
+                "origin": origin,
+                "destination": destination,
+                "distance_km": distance_km,
+                "mode": mode,
+                "advice": "already_late",
+                "current_eta_minutes": round(current_eta_min, 1),
+                "optimal_eta_minutes": round(current_eta_min, 1),
+                "optimal_departure_in_minutes": 0,
+                "savings_minutes": 0.0,
+                "reason": "You need to leave immediately to reach your destination on time.",
+                "congestion_forecast": [],
+                "calculated_at": now.isoformat(),
+            }
+
+    # 6-hour congestion forecast
+    forecast = []
+    for h in range(6):
+        target_hour = (now.hour + h) % 24
+        pred = predict_traffic_congestion(origin, target_hour, db)
+        forecast.append({
+            "hour_offset": h,
+            "hour_label": (now + timedelta(hours=h)).strftime("%H:%M"),
+            "predicted_congestion": pred["predicted_congestion"],
+            "confidence_score": round(pred["confidence_score"], 2),
+        })
+
+    # Find optimal departure window (first 3 hours)
+    best_offset = 0
+    best_score = _CONGESTION_SCORE.get(current_congestion, 1)
+    for entry in forecast[:3]:
+        score = _CONGESTION_SCORE.get(entry["predicted_congestion"], 1)
+        if score < best_score:
+            best_score = score
+            best_offset = entry["hour_offset"]
+
+    best_congestion = forecast[best_offset]["predicted_congestion"]
+    optimal_speed = get_speed_for_congestion(best_congestion, mode)
+    optimal_eta_min = (distance_km / max(optimal_speed, 1)) * 60
+    savings = max(0.0, current_eta_min - optimal_eta_min)
+
+    # Determine advice
+    if current_congestion == "low" or best_offset == 0:
+        advice = "leave_now"
+        reason = (
+            "Traffic is light right now — ideal time to head out."
+            if current_congestion == "low"
+            else "No significant improvement expected in the next few hours — leave now."
+        )
+    else:
+        wait_minutes = best_offset * 60
+        advice = f"wait_{wait_minutes}_minutes"
+        reason = (
+            f"Traffic predicted to ease in ~{wait_minutes} min. "
+            f"Waiting could save approximately {round(savings, 0):.0f} minutes on your journey."
+        )
+        if savings < 2:
+            advice = "leave_now"
+            reason = "Traffic conditions are similar throughout the next few hours — no benefit in waiting."
+
+    logger.info(
+        "should-i-leave: %s→%s %.1fkm %s → advice=%s savings=%.1f min",
+        origin, destination, distance_km, mode, advice, savings,
+    )
+    return {
+        "origin": origin,
+        "destination": destination,
+        "distance_km": distance_km,
+        "mode": mode,
+        "advice": advice,
+        "current_eta_minutes": round(current_eta_min, 1),
+        "optimal_eta_minutes": round(optimal_eta_min, 1),
+        "optimal_departure_in_minutes": best_offset * 60,
+        "savings_minutes": round(savings, 1),
+        "reason": reason,
+        "congestion_forecast": forecast,
+        "calculated_at": now.isoformat(),
     }
