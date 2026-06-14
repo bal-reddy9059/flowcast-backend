@@ -94,6 +94,191 @@ def create_org(
     return _org_dict(org, membership)
 
 
+def _primary(user_id, db) -> tuple:
+    """Return (Organization, OrgMembership) for the user's first active org, or (None, None)."""
+    membership = (
+        db.query(OrgMembership)
+        .filter(OrgMembership.user_id == user_id)
+        .order_by(OrgMembership.joined_at.asc())
+        .first()
+    )
+    if not membership:
+        return None, None
+    org = db.query(Organization).filter(
+        Organization.id == membership.org_id, Organization.is_active == True
+    ).first()
+    return org, membership
+
+
+def _ensure_primary(user_id, db, current_user) -> tuple:
+    """Return (org, membership), auto-creating a personal org when user has none."""
+    org, membership = _primary(user_id, db)
+    if org and membership:
+        return org, membership
+
+    # Build a name unique to this user so it never collides with the UNIQUE constraint
+    display = (getattr(current_user, "full_name", None) or
+               getattr(current_user, "email", "user").split("@")[0]).strip().title()
+    uid_suffix = str(user_id)[:6].upper()
+    name = f"{display}'s Workspace"
+    # Guarantee uniqueness even if two users share the same display name
+    if db.query(Organization).filter(Organization.name == name).first():
+        name = f"{display}'s Workspace ({uid_suffix})"
+
+    slug = f"ws-{str(user_id)[:8]}"
+    if db.query(Organization).filter(Organization.slug == slug).first():
+        slug = f"ws-{str(user_id)[:12]}"
+
+    org = Organization(
+        name=name,
+        slug=slug,
+        plan="enterprise",
+        created_by=user_id,
+    )
+    db.add(org)
+    db.flush()
+    membership = OrgMembership(org_id=org.id, user_id=user_id, role="owner")
+    db.add(membership)
+    db.commit()
+    db.refresh(org)
+    logger.info("Personal workspace '%s' auto-created for user %s", name, user_id)
+    return org, membership
+
+
+# ── Primary-org convenience endpoints (no org_id in URL) ──────────────────────
+# IMPORTANT: must be declared before GET /org/{org_id} to avoid path collision.
+
+@router.get("", status_code=status.HTTP_200_OK)
+def get_my_org(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict:
+    """Return the current user's primary organization (auto-creates one if needed)."""
+    org, membership = _ensure_primary(current_user.id, db, current_user)
+    return {
+        "id":       str(org.id),
+        "name":     org.name,
+        "plan":     org.plan.capitalize(),
+        "my_role":  membership.role,
+        "your_role": membership.role,
+    }
+
+
+@router.get("/members", status_code=status.HTTP_200_OK)
+def list_my_org_members(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict:
+    """List members of the current user's primary organization."""
+    org, _ = _primary(current_user.id, db)
+    if not org:
+        return {"members": [], "total": 0}
+
+    memberships = db.query(OrgMembership).filter(OrgMembership.org_id == org.id).all()
+    members = []
+    for m in memberships:
+        user = db.query(User).filter(User.id == m.user_id).first()
+        if user:
+            members.append({
+                "id":        str(m.user_id),
+                "user_id":   str(m.user_id),
+                "full_name": user.full_name or user.email,
+                "email":     user.email,
+                "role":      m.role,
+                "joined_at": m.joined_at.isoformat(),
+                "is_active": bool(user.is_active),
+            })
+    return {"members": members, "total": len(members)}
+
+
+@router.post("/invite", status_code=status.HTTP_201_CREATED)
+def invite_to_my_org(
+    payload: InviteRequest,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict:
+    """Invite a registered user to the current user's primary organization (admin+)."""
+    org, membership = _primary(current_user.id, db)
+    if not org:
+        raise HTTPException(status_code=404, detail="You are not a member of any organization")
+    if _ROLE_ORDER.get(membership.role, 0) < _ROLE_ORDER["admin"]:
+        raise HTTPException(status_code=403, detail="Requires admin role or higher")
+
+    invitee = db.query(User).filter(User.email == payload.email, User.is_active == True).first()
+    if not invitee:
+        raise HTTPException(status_code=404, detail="No active user found with that email")
+    if db.query(OrgMembership).filter(
+        OrgMembership.org_id == org.id, OrgMembership.user_id == invitee.id
+    ).first():
+        raise HTTPException(status_code=409, detail="User is already a member")
+
+    new_m = OrgMembership(org_id=org.id, user_id=invitee.id, role=payload.role, invited_by=current_user.id)
+    db.add(new_m)
+    db.commit()
+    logger.info("User %s invited to org %s by %s", invitee.id, org.id, current_user.id)
+    return {
+        "id":        str(invitee.id),
+        "full_name": invitee.full_name,
+        "email":     invitee.email,
+        "role":      payload.role,
+        "joined_at": new_m.joined_at.isoformat(),
+        "is_active": True,
+    }
+
+
+@router.put("/members/{user_id}", status_code=status.HTTP_200_OK)
+def change_role_in_my_org(
+    user_id: uuid.UUID,
+    payload: RoleUpdate,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict:
+    """Change a member's role in the current user's primary organization (admin+)."""
+    org, membership = _primary(current_user.id, db)
+    if not org:
+        raise HTTPException(status_code=404, detail="No organization found")
+    if _ROLE_ORDER.get(membership.role, 0) < _ROLE_ORDER["admin"]:
+        raise HTTPException(status_code=403, detail="Requires admin role or higher")
+
+    target = db.query(OrgMembership).filter(
+        OrgMembership.org_id == org.id, OrgMembership.user_id == user_id
+    ).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Member not found")
+    if target.role == "owner" and payload.role != "owner":
+        raise HTTPException(status_code=403, detail="Cannot change the owner's role")
+    target.role = payload.role
+    db.commit()
+    return {"message": f"Role updated to {payload.role}", "user_id": str(user_id)}
+
+
+@router.delete("/members/{user_id}", status_code=status.HTTP_200_OK)
+def remove_from_my_org(
+    user_id: uuid.UUID,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict:
+    """Remove a member from the current user's primary organization (admin+)."""
+    org, membership = _primary(current_user.id, db)
+    if not org:
+        raise HTTPException(status_code=404, detail="No organization found")
+    if _ROLE_ORDER.get(membership.role, 0) < _ROLE_ORDER["admin"]:
+        raise HTTPException(status_code=403, detail="Requires admin role or higher")
+    if user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="Cannot remove yourself")
+
+    target = db.query(OrgMembership).filter(
+        OrgMembership.org_id == org.id, OrgMembership.user_id == user_id
+    ).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Member not found")
+    if target.role == "owner":
+        raise HTTPException(status_code=403, detail="Cannot remove the organization owner")
+    db.delete(target)
+    db.commit()
+    return {"message": "Member removed", "user_id": str(user_id)}
+
+
 @router.get("/mine", status_code=status.HTTP_200_OK)
 def list_my_orgs(
     current_user: Annotated[User, Depends(get_current_user)],

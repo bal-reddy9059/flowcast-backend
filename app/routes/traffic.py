@@ -1036,6 +1036,95 @@ def get_speed_anomalies(
     }
 
 
+# ─── Live Data Sources Status ─────────────────────────────────────────────────
+
+@router.get("/sources")
+def get_data_sources() -> dict:
+    """Show which external traffic APIs are configured and active.
+
+    Use this to verify real-time data is flowing before querying live endpoints.
+    Configure keys in .env to unlock real traffic data:
+      - HERE_API_KEY    → 250,000 free calls/month (recommended)
+      - TOMTOM_API_KEY  → 2,500 free calls/day
+      - GOOGLE_MAPS_DIRECTIONS_API_KEY → district-level data
+    """
+    import os
+    from app.services.here_traffic_service import (
+        HERE_API_KEY as _HERE_KEY,
+        is_available as _here_ok,
+        _key_invalid as _here_invalid,
+    )
+    from app.services.tomtom_service import (
+        TOMTOM_API_KEY as _TT_KEY,
+        _key_ok as _tt_ok,
+        _key_invalid as _tt_invalid,
+    )
+
+    _PLACEHOLDERS = {"", "your_google_maps_key_here", "your_key_here"}
+    _google_raw = os.getenv("GOOGLE_MAPS_DIRECTIONS_API_KEY", "")
+    _google_configured = _google_raw not in _PLACEHOLDERS
+
+    here_configured  = bool(_HERE_KEY)
+    tomtom_configured = bool(_TT_KEY)
+
+    if _here_ok():
+        active_source = "here"
+    elif _tt_ok():
+        active_source = "tomtom"
+    else:
+        active_source = "simulation"
+
+    return {
+        "active_source": active_source,
+        "note": (
+            "Data is coming from real live traffic APIs."
+            if active_source != "simulation"
+            else "No real API keys configured — using physics-based simulation. "
+                 "Add HERE_API_KEY to .env for free live traffic data."
+        ),
+        "sources": {
+            "here": {
+                "name":        "HERE Maps Traffic API v7",
+                "configured":  here_configured,
+                "active":      _here_ok(),
+                "rejected":    _here_invalid,
+                "free_tier":   "250,000 calls/month — no credit card",
+                "sign_up":     "https://developer.here.com",
+                "env_key":     "HERE_API_KEY",
+                "covers":      "80 major India locations (flow + incidents)",
+            },
+            "tomtom": {
+                "name":        "TomTom Traffic API",
+                "configured":  tomtom_configured,
+                "active":      _tt_ok(),
+                "rejected":    _tt_invalid,
+                "free_tier":   "2,500 calls/day — no credit card",
+                "sign_up":     "https://developer.tomtom.com",
+                "env_key":     "TOMTOM_API_KEY",
+                "covers":      "80 major India locations (flow + incidents, fallback to HERE)",
+            },
+            "google_maps": {
+                "name":        "Google Maps Directions API",
+                "configured":  _google_configured,
+                "active":      _google_configured,
+                "free_tier":   "$200/month credit (~40,000 requests free)",
+                "sign_up":     "https://console.cloud.google.com",
+                "env_key":     "GOOGLE_MAPS_DIRECTIONS_API_KEY",
+                "covers":      "766 Indian districts (congestion ratio via duration_in_traffic)",
+            },
+            "simulation": {
+                "name":        "Physics-based simulation",
+                "configured":  True,
+                "active":      active_source == "simulation",
+                "note":        "Always available as last resort — not real data",
+            },
+        },
+        "collection_interval_minutes": 30,
+        "locations_monitored":         80,
+        "districts_monitored":         766,
+    }
+
+
 # ─── Incident Statistics ────────────────────────────────────────────────────────
 
 @router.get("/incidents/stats")

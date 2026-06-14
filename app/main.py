@@ -236,21 +236,33 @@ async def _zone_alert_monitor():
     from app.models.zone import GeofenceZone, ZoneAlert
     from app.routes.zones import _query_zone_traffic
     from app.services.notification_service import create_notification, send_websocket_notification
+    import json as _json
     _CONGESTION_SCORE = {"low": 0, "medium": 1, "high": 2}
-    _last_alerted: dict[str, datetime] = {}
+    _COOLDOWN_SECONDS = 1800  # 30 minutes
     while True:
         await asyncio.sleep(60)
         db = SessionLocal()
         try:
             zones = db.query(GeofenceZone).filter(GeofenceZone.is_active == True).all()
+            now = datetime.now(timezone.utc)
             for zone in zones:
                 locations, avg_speed, dominant = _query_zone_traffic(zone, db)
                 if _CONGESTION_SCORE.get(dominant, 0) < _CONGESTION_SCORE.get(zone.congestion_threshold, 2):
                     continue
-                last = _last_alerted.get(str(zone.id))
-                if last and (datetime.now(timezone.utc) - last).total_seconds() < 1800:
+
+                # DB-based cooldown — survives server restarts unlike an in-memory dict
+                cooldown_cutoff = now - timedelta(seconds=_COOLDOWN_SECONDS)
+                recent = (
+                    db.query(ZoneAlert)
+                    .filter(
+                        ZoneAlert.zone_id == zone.id,
+                        ZoneAlert.triggered_at >= cooldown_cutoff,
+                    )
+                    .first()
+                )
+                if recent:
                     continue
-                import json as _json
+
                 alert = ZoneAlert(
                     zone_id=zone.id,
                     congestion_level=dominant,
@@ -259,7 +271,7 @@ async def _zone_alert_monitor():
                 )
                 db.add(alert)
                 db.commit()
-                _last_alerted[str(zone.id)] = datetime.now(timezone.utc)
+
                 notification = await create_notification(
                     user_id=zone.user_id,
                     route_id=None,
@@ -271,6 +283,7 @@ async def _zone_alert_monitor():
                     db=db,
                 )
                 await send_websocket_notification(str(zone.user_id), notification, ws_manager, db)
+                logger.info("Zone alert fired for zone '%s' (user %s, level=%s)", zone.name, zone.user_id, dominant)
         except Exception as exc:
             logger.error("Zone alert monitor error: %s", exc)
         finally:

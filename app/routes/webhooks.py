@@ -140,9 +140,25 @@ def _delivery_row(d: WebhookDelivery) -> dict:
 
 def _webhook_dict(wh: Webhook, db: Optional[Session] = None,
                   include_stats: bool = True) -> dict:
-    total      = wh.total_deliveries or 0
-    failed     = wh.failed_deliveries or 0
-    successful = max(0, total - failed)
+    # Compute accurate counts from actual delivery records when db is available.
+    # The model's `total_deliveries` column only counts successes (incremented on
+    # success in webhook_service), so we must NOT subtract failed from it.
+    if db is not None and include_stats:
+        from sqlalchemy import case as _case, func as _func
+        row = db.query(
+            _func.count(WebhookDelivery.id).label("total"),
+            _func.sum(_case(
+                (WebhookDelivery.http_status.between(200, 299), 1), else_=0
+            )).label("success"),
+        ).filter(WebhookDelivery.webhook_id == wh.id).one()
+        total      = int(row.total   or 0)
+        successful = int(row.success or 0)
+        failed     = total - successful
+    else:
+        # Fallback to counter columns when db not supplied
+        successful = wh.total_deliveries or 0
+        failed     = wh.failed_deliveries or 0
+        total      = successful + failed
 
     base = {
         "id":    str(wh.id),
@@ -812,9 +828,10 @@ async def list_webhooks(
 
     result = [_webhook_dict(wh, db=db) for wh in webhooks]
 
-    total_deliveries = sum(wh.total_deliveries or 0 for wh in webhooks)
-    total_failed     = sum(wh.failed_deliveries or 0 for wh in webhooks)
-    successful       = total_deliveries - total_failed
+    # Re-use the already-computed accurate stats from each dict to build the summary
+    total_deliveries = sum(r["stats"]["total_deliveries"]      for r in result if "stats" in r)
+    successful       = sum(r["stats"]["successful_deliveries"] for r in result if "stats" in r)
+    total_failed     = sum(r["stats"]["failed_deliveries"]     for r in result if "stats" in r)
 
     return {
         "webhooks": result,

@@ -51,6 +51,13 @@ def get_rush_hour_forecast(
         key=lambda x: _CONGESTION_SCORE.get(x["predicted_congestion"], 1),
     )
 
+    # Frontend-compatible format: { hour: "08:00", score: 0-100 }
+    _congestion_to_score = {"low": 18, "medium": 52, "high": 82}
+    hourly = [
+        {"hour": f["time_label"], "score": _congestion_to_score.get(f["predicted_congestion"], 40)}
+        for f in forecast
+    ]
+
     logger.info("24h forecast generated for %s", location)
     return {
         "location": location,
@@ -58,6 +65,7 @@ def get_rush_hour_forecast(
         "peak_congestion_hour": peak,
         "best_departure_next_8h": best_next_8h,
         "hourly_forecast": forecast,
+        "hourly": hourly,
     }
 
 
@@ -208,6 +216,94 @@ def get_commute_score(
             "low_pct": round(counts.get("low", 0) / total * 100, 1),
         },
         "evaluated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@router.get("/score", status_code=status.HTTP_200_OK)
+def get_commute_score_alias(
+    location: str = Query(..., min_length=2, description="Hyderabad location name"),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Commute score + best/worst windows for the frontend dashboard.
+
+    Extends /commute/commute-score with best_window, worst_window,
+    and avg_commute_minutes derived from the 24-hour congestion forecast.
+    """
+    from app.services.eta_service import calculate_eta_for_location
+
+    # --- base score (reuse existing logic inline) ---
+    from collections import Counter
+    from app.models.predictor import TrafficRecord, Incident
+    from app.services.city_aliases import location_filter
+
+    since = datetime.now(timezone.utc) - timedelta(hours=1)
+    records = (
+        db.query(TrafficRecord)
+        .filter(location_filter(TrafficRecord.location, location), TrafficRecord.timestamp >= since)
+        .all()
+    )
+    active_incidents = (
+        db.query(Incident)
+        .filter(location_filter(Incident.location, location), Incident.is_active.is_(True))
+        .count()
+    )
+
+    if records:
+        counts = Counter(r.congestion_level for r in records if r.congestion_level)
+        total = len(records)
+        high_pct = counts.get("high", 0) / total * 100
+        medium_pct = counts.get("medium", 0) / total * 100
+        score = round(max(0.0, min(100.0, 100 - high_pct * 0.6 - medium_pct * 0.2 - active_incidents * 5)), 1)
+    else:
+        score = 50
+
+    if score >= 80:
+        grade, verdict = "A", "Great time to commute"
+    elif score >= 65:
+        grade, verdict = "B", "Good — minor delays likely"
+    elif score >= 50:
+        grade, verdict = "C", "Moderate traffic"
+    elif score >= 35:
+        grade, verdict = "D", "Heavy traffic — delays expected"
+    else:
+        grade, verdict = "F", "Avoid if possible — severe congestion"
+
+    # --- 24-hour forecast to find best/worst windows ---
+    now = datetime.now(timezone.utc)
+    _LEVEL = {"low": 0, "medium": 1, "high": 2}
+    slots = []
+    for h in range(24):
+        target_hour = (now.hour + h) % 24
+        pred = predict_traffic_congestion(location, target_hour, db)
+        slots.append({
+            "label": (now + timedelta(hours=h)).strftime("%I:%M %p").lstrip("0"),
+            "score": _LEVEL.get(pred["predicted_congestion"], 1),
+        })
+
+    def _window_label(i: int) -> str:
+        return f"{slots[i]['label']} – {slots[(i + 2) % 24]['label']}"
+
+    best_i  = min(range(22), key=lambda i: slots[i]["score"] + slots[i + 1]["score"])
+    worst_i = max(range(22), key=lambda i: slots[i]["score"] + slots[i + 1]["score"])
+
+    # --- avg commute (10 km baseline driving) ---
+    try:
+        eta = calculate_eta_for_location(location, 10.0, "driving", db)
+        avg_minutes = round(eta.eta_minutes)
+    except Exception:
+        avg_minutes = 24
+
+    logger.info("Commute score for %s: %.1f (%s)", location, score, grade)
+    return {
+        "location": location,
+        "score": score,
+        "grade": grade,
+        "verdict": verdict,
+        "best_window": _window_label(best_i),
+        "worst_window": _window_label(worst_i),
+        "avg_commute_minutes": avg_minutes,
+        "active_incidents": active_incidents,
+        "evaluated_at": now.isoformat(),
     }
 
 

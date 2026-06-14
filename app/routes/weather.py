@@ -37,6 +37,21 @@ _MODIFIER_LABEL = {
     "severe":   "Severe impact — major delays, consider postponing travel",
 }
 
+# Frontend-compatible modifier floats (used in congestionModifier bar)
+_MODIFIER_FLOAT = {"none": 0.0, "light": 0.1, "moderate": 0.3, "severe": 0.5}
+
+
+def _frontend_snapshot(snap: dict) -> dict:
+    """Add camelCase aliases expected by the frontend alongside existing fields."""
+    modifier = snap.get("congestion_modifier", "none")
+    return {
+        **snap,
+        "temp":              snap.get("temp_c"),
+        "wind":              snap.get("wind_kmh"),
+        "visibility":        snap.get("visibility_km"),
+        "congestionModifier": _MODIFIER_FLOAT.get(modifier, 0.0),
+    }
+
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
@@ -57,8 +72,8 @@ def get_all_cities_weather() -> dict:
 
     Cache is refreshed every 30 minutes.
     """
-    snapshots = get_all_cached()
-    if not snapshots:
+    raw = get_all_cached()
+    if not raw:
         return {
             "message": "Weather cache is warming up — try again in 30 seconds.",
             "cities": [],
@@ -66,7 +81,8 @@ def get_all_cities_weather() -> dict:
         }
 
     _order = {"severe": 0, "moderate": 1, "light": 2, "none": 3}
-    snapshots.sort(key=lambda s: _order.get(s.get("congestion_modifier", "none"), 3))
+    raw.sort(key=lambda s: _order.get(s.get("congestion_modifier", "none"), 3))
+    snapshots = [_frontend_snapshot(s) for s in raw]
 
     none_count     = sum(1 for s in snapshots if s.get("congestion_modifier") == "none")
     light_count    = sum(1 for s in snapshots if s.get("congestion_modifier") == "light")

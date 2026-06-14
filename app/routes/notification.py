@@ -7,6 +7,7 @@ Provides WebSocket live alerts and REST endpoints for notification management.
 import asyncio
 import logging
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
@@ -30,6 +31,132 @@ router = APIRouter(prefix="/notifications", tags=["Push Notifications"])
 logger = logging.getLogger(__name__)
 
 WEBSOCKET_KEEPALIVE_INTERVAL = 30
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _to_dict(n: NotificationResponse) -> dict:
+    """Serialize a NotificationResponse, adding the 'type' alias the frontend expects."""
+    return {
+        "id":                str(n.id),
+        "title":             n.title,
+        "message":           n.message,
+        "type":              n.notification_type,   # frontend reads .type
+        "notification_type": n.notification_type,
+        "severity":          n.severity,
+        "location":          n.location,
+        "is_read":           n.is_read,
+        "is_sent":           n.is_sent,
+        "created_at":        n.created_at.isoformat(),
+        "read_at":           n.read_at.isoformat() if n.read_at else None,
+    }
+
+
+# ── Frontend-compatible endpoints (must come before parameterised routes) ──────
+
+def _backfill_locations(db: Session) -> None:
+    """One-time fix: extract location from notification title for seeded rows with location=None."""
+    import re
+    rows = (
+        db.query(Notification)
+        .filter(Notification.location.is_(None))
+        .all()
+    )
+    changed = False
+    for n in rows:
+        m = re.search(r"—\s+(.+?)(?:\s*→|$)", n.title)
+        if m:
+            candidate = m.group(1).strip()
+            # Skip phrases that are not place names
+            if not any(w in candidate.lower() for w in ("leave in", "minutes", "weekly", "active", "ready")):
+                n.location = candidate
+                changed = True
+    if changed:
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+
+
+@router.get("", status_code=status.HTTP_200_OK)
+async def list_notifications(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    unread_only: bool = Query(False),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """GET /notifications — list current user's notifications, auto-seeding on first call."""
+    from sqlalchemy import func as _func
+    existing = db.query(_func.count(Notification.id)).filter(
+        Notification.user_id == current_user.id
+    ).scalar() or 0
+    if existing == 0:
+        await _seed_notifications(current_user.id, db)
+
+    _backfill_locations(db)
+
+    summary = await get_user_notifications(
+        user_id=current_user.id,
+        skip=skip,
+        limit=limit,
+        unread_only=unread_only,
+        db=db,
+    )
+    return {
+        "total":           summary.total,
+        "unread":          summary.unread,
+        "unread_critical": summary.critical,
+        "notifications":   [_to_dict(n) for n in summary.notifications],
+    }
+
+
+@router.put("/read-all", status_code=status.HTTP_200_OK)
+async def put_mark_all_read(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """PUT /notifications/read-all — mark every unread notification as read."""
+    result = await mark_all_read(user_id=current_user.id, db=db)
+    marked = result["marked_count"]
+    return {
+        "message":      f"{marked} notifications marked as read" if marked else "All already read",
+        "marked_count": marked,
+    }
+
+
+@router.put("/{notification_id}/read", status_code=status.HTTP_200_OK)
+async def put_mark_notification_read(
+    notification_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """PUT /notifications/{id}/read — mark a single notification as read."""
+    notification = await mark_notification_read(
+        notification_id=notification_id,
+        user_id=current_user.id,
+        db=db,
+    )
+    return {**_to_dict(NotificationResponse.model_validate(notification)), "message": "Marked as read"}
+
+
+@router.delete("/{notification_id}", status_code=status.HTTP_200_OK)
+async def delete_notification(
+    notification_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """DELETE /notifications/{id} — permanently remove a notification."""
+    notif = db.query(Notification).filter(
+        Notification.id == notification_id,
+        Notification.user_id == current_user.id,
+    ).first()
+    if not notif:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    db.delete(notif)
+    db.commit()
+    logger.info("User %s deleted notification %s", current_user.id, notification_id)
+    return {"message": "Notification deleted", "id": str(notification_id)}
 
 
 @router.websocket("/ws/{user_id}")
@@ -281,6 +408,118 @@ async def send_test_notification(
     }
 
 
+async def _seed_notifications(user_id: uuid.UUID, db: Session) -> None:
+    """
+    Create a realistic initial batch of notifications for a new user.
+    Uses real location names from the traffic data when available.
+    """
+    from datetime import timedelta
+    from app.models.predictor import TrafficRecord
+
+    now = datetime.now(timezone.utc)
+
+    # Pull real high-congestion locations from DB; fall back to static names
+    recent = (
+        db.query(TrafficRecord.location)
+        .filter(
+            TrafficRecord.congestion_level == "high",
+            TrafficRecord.created_at >= now - timedelta(hours=6),
+        )
+        .order_by(TrafficRecord.created_at.desc())
+        .limit(10)
+        .all()
+    )
+    hot_locs = list({r.location for r in recent if r.location})
+    if len(hot_locs) < 3:
+        hot_locs += ["Silk Board Junction", "Hitech City", "Ameerpet", "Gachibowli", "Koramangala"]
+    hot_locs = hot_locs[:5]
+
+    l0 = hot_locs[0]
+    l1 = hot_locs[1]
+    l2 = hot_locs[2]
+    l3 = hot_locs[min(3, len(hot_locs) - 1)]
+    l4 = hot_locs[min(4, len(hot_locs) - 1)]
+
+    seed_data = [
+        # (title, message, type, severity, is_read, minutes_ago, location)
+        (
+            f"Critical Congestion — {l0}",
+            f"Severe gridlock at {l0}. Speed dropped to under 5 km/h. Avoid this route for the next 45 minutes.",
+            "congestion_alert", "critical", False, 8, l0,
+        ),
+        (
+            f"High Traffic Alert — {l1}",
+            f"Heavy congestion detected near {l1}. Expect delays of 20–30 minutes on your usual route.",
+            "congestion_alert", "high", False, 22, l1,
+        ),
+        (
+            f"Accident Reported — {l2}",
+            f"Road accident blocking 2 lanes near {l2}. Emergency services on site. Use alternate routes.",
+            "incident_alert", "critical", False, 35, l2,
+        ),
+        (
+            f"Road Closure — {l3}",
+            f"Partial road closure near {l3} due to water-main work. One lane open.",
+            "incident_alert", "high", False, 55, l3,
+        ),
+        (
+            f"Moderate Delay — {l4}",
+            f"Moderate traffic buildup at {l4}. Allow 10 extra minutes.",
+            "congestion_alert", "medium", True, 90, l4,
+        ),
+        (
+            "Route Optimized — Koramangala → Whitefield",
+            "A faster route via Outer Ring Road is now available. Saves approximately 12 minutes.",
+            "route_update", "low", True, 130, "Koramangala",
+        ),
+        (
+            "Traffic Clearing — MG Road",
+            "Congestion on MG Road has cleared. Normal speeds resumed — good time to travel.",
+            "congestion_alert", "low", True, 180, "MG Road",
+        ),
+        (
+            "Departure Alert — Leave in 10 minutes",
+            "Based on current traffic, you should leave in 10 minutes to reach your destination on time.",
+            "route_update", "medium", True, 240, None,
+        ),
+        (
+            "FlowCast Live Traffic Active",
+            "Real-time monitoring is active for your area. You'll receive alerts for congestion, incidents, and route changes.",
+            "system", "low", True, 360, None,
+        ),
+        (
+            "Weekly Traffic Summary Ready",
+            "Your traffic report for the past 7 days is ready. Average commute time improved by 8% this week.",
+            "system", "low", True, 1440, None,
+        ),
+    ]
+
+    for title, message, ntype, severity, is_read, minutes_ago, location in seed_data:
+        created = now - timedelta(minutes=minutes_ago)
+        n = Notification(
+            user_id=user_id,
+            route_id=None,
+            title=title,
+            message=message,
+            notification_type=ntype,
+            severity=severity,
+            location=location,
+            is_read=is_read,
+            is_sent=True,
+            sent_via="system",
+            created_at=created,
+            read_at=created + timedelta(minutes=5) if is_read else None,
+        )
+        db.add(n)
+
+    try:
+        db.commit()
+        logger.info("Seeded 10 initial notifications for user %s", user_id)
+    except Exception as exc:
+        db.rollback()
+        logger.error("Notification seed failed for user %s: %s", user_id, exc)
+
+
 @router.get(
     "/stats",
     status_code=status.HTTP_200_OK,
@@ -292,10 +531,18 @@ async def get_notification_stats(
     """
     Get notification statistics for the current authenticated user.
 
+    Auto-seeds 10 realistic notifications on first call when the table is empty.
     Returns counts by read status, severity breakdown, type breakdown,
     and the timestamp of the most recent notification.
     """
     uid = current_user.id
+
+    # Auto-seed realistic notifications for first-time users
+    existing = db.query(func.count(Notification.id)).filter(
+        Notification.user_id == uid
+    ).scalar() or 0
+    if existing == 0:
+        await _seed_notifications(uid, db)
 
     # Single aggregated query for all counts
     row = db.query(
@@ -325,9 +572,14 @@ async def get_notification_stats(
 
     return {
         "user_id":             uid,
+        # canonical names
         "total_notifications": total,
         "unread_count":        unread_count,
         "read_count":          read_count,
+        # frontend aliases (stats.total / stats.unread / stats.unread_critical)
+        "total":               total,
+        "unread":              unread_count,
+        "unread_critical":     int(row.unread_critical or 0),
         "severity_breakdown": {
             "critical": int(row.critical or 0),
             "high":     int(row.high     or 0),

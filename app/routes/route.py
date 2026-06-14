@@ -5,6 +5,7 @@ Provides API endpoints for route optimization, saving routes, and managing user 
 """
 
 import logging
+import math
 import os
 import secrets
 import uuid
@@ -126,6 +127,157 @@ async def optimize_route(
 
     logger.info("Route optimized for user %s", current_user.id)
     return response
+
+
+def _geocode(name: str) -> Optional[dict]:
+    """Fuzzy-match a free-text location name against INDIA_LOCATIONS."""
+    from app.services.india_locations import INDIA_LOCATIONS
+    name_lower = name.lower().strip()
+    # Exact match
+    for loc in INDIA_LOCATIONS:
+        if loc["name"].lower() == name_lower:
+            return loc
+    # Substring match
+    best: Optional[dict] = None
+    best_len = 0
+    for loc in INDIA_LOCATIONS:
+        loc_name = loc["name"].lower()
+        if loc_name in name_lower or name_lower in loc_name:
+            match_len = len(loc_name)
+            if match_len > best_len:
+                best_len = match_len
+                best = loc
+    if best:
+        return best
+    # Word match (≥4 chars)
+    for loc in INDIA_LOCATIONS:
+        for word in name_lower.split():
+            if len(word) >= 4 and word in loc["name"].lower():
+                return loc
+    return None
+
+
+def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    R = 6371.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    a = (math.sin((phi2 - phi1) / 2) ** 2
+         + math.cos(phi1) * math.cos(phi2)
+         * math.sin(math.radians(lng2 - lng1) / 2) ** 2)
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+class OptimizeByNameRequest(BaseModel):
+    origin: str = Field(..., min_length=2)
+    destination: str = Field(..., min_length=2)
+    mode: str = Field("driving", pattern="^(driving|transit|walking)$")
+    alternatives: bool = False
+
+
+@router.post("/optimize")
+async def optimize_route_by_name(
+    payload: OptimizeByNameRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Optimize a route given free-text origin/destination names.
+
+    Geocodes the names internally via INDIA_LOCATIONS, calculates distance
+    using haversine + 25% routing overhead, and enriches with live traffic data.
+    Returns the same schema as ORIGIN_STUB on the frontend.
+    """
+    from app.models.predictor import TrafficRecord, Incident
+
+    HYDERABAD_DEFAULT = {"lat": 17.4486, "lng": 78.3908, "name": "Hitech City"}
+
+    origin_loc = _geocode(payload.origin) or {**HYDERABAD_DEFAULT, "name": payload.origin}
+    dest_loc   = _geocode(payload.destination) or {**HYDERABAD_DEFAULT, "name": payload.destination}
+
+    straight_km = _haversine_km(
+        origin_loc["lat"], origin_loc["lng"],
+        dest_loc["lat"], dest_loc["lng"],
+    )
+    # 25% overhead converts straight-line to road distance
+    road_km = round(straight_km * 1.25, 1)
+
+    # Latest traffic near origin
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(hours=1)
+    origin_word = origin_loc["name"].split()[0]
+    origin_traffic = (
+        db.query(TrafficRecord)
+        .filter(
+            TrafficRecord.location.ilike(f"%{origin_word}%"),
+            TrafficRecord.timestamp >= since,
+        )
+        .order_by(TrafficRecord.timestamp.desc())
+        .first()
+    )
+
+    if origin_traffic:
+        avg_speed = float(origin_traffic.average_speed or 35.0)
+        congestion = origin_traffic.congestion_level or "medium"
+        confidence = "high"
+    else:
+        avg_speed = {"driving": 38.0, "transit": 22.0, "walking": 5.0}.get(payload.mode, 38.0)
+        congestion = "medium"
+        confidence = "medium"
+
+    if payload.mode == "transit":
+        avg_speed *= 0.6
+    elif payload.mode == "walking":
+        avg_speed = 5.0
+
+    avg_speed = max(avg_speed, 3.0)
+    duration_min = round(road_km / avg_speed * 60)
+
+    opt_score  = {"low": 95, "medium": 78, "high": 62}.get(congestion, 78)
+    co2_factor = {"driving": 0.12, "transit": 0.04, "walking": 0.0}.get(payload.mode, 0.12)
+    co2_kg     = round(road_km * co2_factor, 2)
+    trees_offset = round(co2_kg / 10, 2)
+
+    depart_offset = {"high": 20, "medium": 5, "low": 0}.get(congestion, 5)
+    dep = now + timedelta(minutes=depart_offset)
+    hour12 = dep.hour % 12 or 12
+    best_dep = f"{hour12}:{dep.minute:02d} {'AM' if dep.hour < 12 else 'PM'}"
+
+    incidents = (
+        db.query(Incident)
+        .filter(
+            Incident.is_active.is_(True),
+            Incident.latitude.between(origin_loc["lat"] - 0.1, origin_loc["lat"] + 0.1),
+            Incident.longitude.between(origin_loc["lng"] - 0.1, origin_loc["lng"] + 0.1),
+        )
+        .limit(3)
+        .all()
+    )
+    alerts = [
+        {
+            "location": i.location or origin_loc["name"],
+            "status": (i.incident_type or "incident").replace("_", " ").title(),
+            "speed": max(int(avg_speed * 0.7), 5),
+        }
+        for i in incidents
+    ] or [{"location": origin_loc["name"], "status": "Fluid", "speed": int(avg_speed)}]
+
+    logger.info(
+        "Named route optimized: %s → %s (%.1fkm, %dmin) user=%s",
+        payload.origin, payload.destination, road_km, duration_min, current_user.id,
+    )
+    return {
+        "origin": origin_loc["name"],
+        "destination": dest_loc["name"],
+        "distance_km": road_km,
+        "duration_minutes": duration_min,
+        "avg_speed_kmh": int(avg_speed),
+        "optimization_score": opt_score,
+        "co2_kg": co2_kg,
+        "trees_offset": trees_offset,
+        "best_departure": best_dep,
+        "confidence": confidence,
+        "alerts": alerts,
+        "congestion_summary": congestion,
+        "mode": payload.mode,
+    }
 
 
 @router.post("/save", response_model=SavedRouteResponse, status_code=status.HTTP_201_CREATED)

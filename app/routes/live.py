@@ -11,7 +11,13 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.database import SessionLocal
 from app.services.car_simulator import car_simulator
-from app.services.eta_service import calculate_eta_for_location
+from app.services.eta_service import (
+    calculate_eta_for_location,
+    fetch_live_location_flow,
+    calculate_eta_minutes,
+    get_speed_for_congestion,
+    TRAFFIC_CONDITIONS,
+)
 
 router = APIRouter(tags=["Live Traffic"])
 logger = logging.getLogger(__name__)
@@ -194,7 +200,7 @@ class LiveTripStart(BaseModel):
 
 
 @router.post("/trips/live/start", status_code=status.HTTP_201_CREATED)
-def start_live_trip(payload: LiveTripStart) -> dict:
+async def start_live_trip(payload: LiveTripStart) -> dict:
     """Start a live trip tracking session.
 
     Returns a `session_id` and the WebSocket URL to connect to for live ETA updates.
@@ -204,34 +210,59 @@ def start_live_trip(payload: LiveTripStart) -> dict:
 
     ETA updates are pushed every 15 seconds with a `trend` field
     (`improving` / `worsening` / `stable`) so your UI can show direction of change.
+
+    `data_source` in the response tells you whether the initial ETA came from
+    a live API call (`here` / `tomtom`) or a cached DB reading.
     """
     session_id = str(uuid.uuid4())
+
+    # 1. Try to fetch live traffic data directly from HERE / TomTom for the origin
+    live   = await fetch_live_location_flow(payload.origin)
+    source = "database_cache"
+
+    # 2. Fall back to DB cache (used as base, then overridden below if live data landed)
     db = SessionLocal()
     try:
         eta = calculate_eta_for_location(payload.origin, payload.distance_km, payload.mode, db)
     finally:
         db.close()
 
+    # 3. If live data arrived, recalculate ETA with the real speed (more accurate than DB cache)
+    if live:
+        mode_cap   = get_speed_for_congestion(live["congestion_level"], payload.mode)
+        real_speed = min(live["speed_kmh"], mode_cap) if live["speed_kmh"] > 0 else mode_cap
+        if real_speed > 0:
+            eta_min, eta_buf = calculate_eta_minutes(payload.distance_km, real_speed)
+            eta.eta_minutes              = eta_min
+            eta.eta_with_buffer_minutes  = eta_buf
+            eta.congestion_level         = live["congestion_level"]
+            eta.average_speed_kmh        = real_speed
+            eta.traffic_condition        = TRAFFIC_CONDITIONS.get(live["congestion_level"], "")
+            eta.confidence               = "high"
+            eta.data_age_minutes         = 0.0
+            source                       = live["source"]
+
     _live_sessions[session_id] = {
-        "origin": payload.origin,
-        "destination": payload.destination,
-        "distance_km": payload.distance_km,
-        "mode": payload.mode,
-        "started_at": datetime.now(timezone.utc),
-        "websocket": None,
-        "last_eta": eta.eta_minutes,
+        "origin":         payload.origin,
+        "destination":    payload.destination,
+        "distance_km":    payload.distance_km,
+        "mode":           payload.mode,
+        "started_at":     datetime.now(timezone.utc),
+        "websocket":      None,
+        "last_eta":       eta.eta_minutes,
         "last_congestion": eta.congestion_level,
-        "last_speed": eta.average_speed_kmh,
+        "last_speed":     eta.average_speed_kmh,
     }
     return {
-        "session_id": session_id,
-        "origin": payload.origin,
-        "destination": payload.destination,
+        "session_id":          session_id,
+        "origin":              payload.origin,
+        "destination":         payload.destination,
         "initial_eta_minutes": eta.eta_minutes,
-        "congestion_level": eta.congestion_level,
-        "speed_kmh": eta.average_speed_kmh,
-        "ws_url": f"/api/v1/trips/ws/{session_id}",
-        "started_at": datetime.now(timezone.utc).isoformat(),
+        "congestion_level":    eta.congestion_level,
+        "speed_kmh":           eta.average_speed_kmh,
+        "data_source":         source,
+        "ws_url":              f"/api/v1/trips/ws/{session_id}",
+        "started_at":          datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -578,8 +609,8 @@ def get_ml_model_info() -> dict:
 def ml_predict_now(
     hour: int = 0,
     dow: int = 0,
-    vehicle_count: float = 500.0,
-    average_speed: float = 35.0,
+    vehicle_count: Optional[float] = None,
+    average_speed: Optional[float] = None,
     hours_ahead: int = 3,
 ) -> dict:
     """
@@ -588,22 +619,33 @@ def ml_predict_now(
 
     Useful for testing the model without a WebSocket connection.
     `hour` = 0-23, `dow` = 0 (Mon) – 6 (Sun).
+
+    Leave `vehicle_count` and `average_speed` empty to use hour-appropriate
+    realistic defaults (e.g. hour=1 will automatically use nighttime values
+    instead of flat midday numbers, giving correct predictions).
     """
-    from app.services.ml_prediction_service import ml_model
+    from app.services.ml_prediction_service import ml_model, _hour_defaults
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
     target_hour = hour if hour != 0 else now.hour
     target_dow  = dow  if dow  != 0 else now.weekday()
-    current = ml_model.predict(target_hour, target_dow, vehicle_count, average_speed)
+
+    # Resolve what defaults will actually be used, for display purposes
+    vc_def, spd_def = _hour_defaults(target_hour)
+    display_vc  = vehicle_count if vehicle_count is not None else vc_def
+    display_spd = average_speed if average_speed is not None else spd_def
+
+    current  = ml_model.predict(target_hour, target_dow, vehicle_count, average_speed)
     forecast = ml_model.predict_hours_ahead(target_hour, target_dow, vehicle_count, average_speed, hours_ahead)
     return {
         "input": {
-            "hour": target_hour,
-            "day_of_week": target_dow,
-            "vehicle_count": vehicle_count,
-            "average_speed": average_speed,
+            "hour":          target_hour,
+            "day_of_week":   target_dow,
+            "vehicle_count": display_vc,
+            "average_speed": display_spd,
+            "defaults_auto": vehicle_count is None and average_speed is None,
         },
         "current_prediction": current,
-        "forecast": forecast,
-        "model_info": ml_model.model_info(),
+        "forecast":           forecast,
+        "model_info":         ml_model.model_info(),
     }

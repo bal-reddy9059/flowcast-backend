@@ -18,7 +18,7 @@ import logging
 import threading
 from collections import Counter
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
@@ -41,17 +41,36 @@ def _hour_label(h: int) -> str:
     return f"{h - 12}:00 PM"
 
 
+def _hour_defaults(hour: int) -> tuple[float, float]:
+    """Return realistic (vehicle_count, average_speed) for a given hour of day.
+
+    Used when the caller does not supply explicit traffic values, so predictions
+    for 1 AM don't use daytime defaults and come out wrong.
+    """
+    if hour >= 22 or hour <= 5:   return 70.0,  68.0   # night  — near empty, fast
+    if 6  <= hour <= 7:            return 320.0, 48.0   # early morning — building up
+    if 8  <= hour <= 10:           return 1700.0, 16.0  # morning rush
+    if 11 <= hour <= 16:           return 680.0,  36.0  # mid-day
+    if 17 <= hour <= 20:           return 1850.0, 14.0  # evening rush
+    return 420.0, 40.0                                  # late evening
+
+
 def _make_feature_row(hour: int, dow: int,
-                      vehicle_count: float = 500.0,
-                      average_speed: float = 35.0) -> list[float]:
+                      vehicle_count: Optional[float] = None,
+                      average_speed: Optional[float] = None) -> list[float]:
+    """Build the 7-feature vector. When vehicle_count/average_speed are None,
+    hour-appropriate realistic defaults are used instead of flat midday values."""
+    vc_def, spd_def = _hour_defaults(hour)
+    vc  = vehicle_count if vehicle_count is not None else vc_def
+    spd = average_speed if average_speed is not None else spd_def
     return [
         hour / 23.0,
         dow / 6.0,
         1.0 if dow >= 5 else 0.0,
         1.0 if (7 <= hour <= 10 or 17 <= hour <= 20) else 0.0,
         1.0 if (hour >= 22 or hour <= 5) else 0.0,
-        min(vehicle_count / 2000.0, 1.0),
-        min(average_speed / 80.0, 1.0),
+        min(vc  / 2000.0, 1.0),
+        min(spd / 80.0,   1.0),
     ]
 
 
@@ -162,8 +181,8 @@ class TrafficMLModel:
         self,
         hour: int,
         dow: int,
-        vehicle_count: float = 500.0,
-        average_speed: float = 35.0,
+        vehicle_count: Optional[float] = None,
+        average_speed: Optional[float] = None,
     ) -> dict:
         """Return predicted congestion + probability breakdown."""
         row = _make_feature_row(hour, dow, vehicle_count, average_speed)
@@ -196,17 +215,23 @@ class TrafficMLModel:
         self,
         base_hour: int,
         base_dow: int,
-        vehicle_count: float = 500.0,
-        average_speed: float = 35.0,
+        vehicle_count: Optional[float] = None,
+        average_speed: Optional[float] = None,
         hours_ahead: int = 3,
     ) -> list[dict]:
-        """Return predictions for the next N hours."""
+        """Return predictions for the next N hours.
+
+        vehicle_count/average_speed are re-derived per target hour when None,
+        so a forecast from 1 AM correctly uses night defaults at 2 AM, 3 AM, etc.
+        """
         results = []
         for offset in range(1, hours_ahead + 1):
             target_hour = (base_hour + offset) % 24
             extra_days  = (base_hour + offset) // 24
             target_dow  = (base_dow + extra_days) % 7
 
+            # When caller passes None, each hour in the forecast gets its own
+            # realistic defaults rather than carrying forward a fixed value.
             pred = self.predict(target_hour, target_dow, vehicle_count, average_speed)
             pred["offset_hours"] = offset
             pred["target_hour"]  = target_hour

@@ -6,7 +6,7 @@ Provides real-time ETA calculations using stored traffic observations.
 
 import logging
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select, func
@@ -138,6 +138,43 @@ def get_location_traffic(location: str, db: Session) -> tuple[Any, str, float]:
 
     logger.debug("ETA record for %s age=%.1f min confidence=%s", location, age_minutes, confidence)
     return record, confidence, round(age_minutes, 1)
+
+
+async def fetch_live_location_flow(location: str) -> Optional[dict]:
+    """
+    Look up a location by name in INDIA_LOCATIONS and fetch live traffic flow
+    directly from HERE or TomTom — bypasses the DB cache for on-demand freshness.
+
+    Returns dict: speed_kmh, congestion_level, source — or None when location
+    is unknown or all APIs are unavailable.
+    """
+    from app.services.india_locations import INDIA_LOCATIONS
+    from app.services import here_traffic_service
+    from app.services.tomtom_service import (
+        fetch_flow as _tomtom_flow,
+        classify_congestion as _classify,
+    )
+
+    loc = next(
+        (l for l in INDIA_LOCATIONS if l["name"].lower() == location.lower()),
+        None,
+    )
+    if not loc:
+        return None
+
+    flow = await here_traffic_service.fetch_flow(loc["lat"], loc["lng"])
+    if flow is None:
+        flow = await _tomtom_flow(loc["lat"], loc["lng"])
+    if flow is None:
+        return None
+
+    cur   = float(flow.get("currentSpeed",  35))
+    free  = float(flow.get("freeFlowSpeed", 60))
+    return {
+        "speed_kmh":       cur,
+        "congestion_level": _classify(cur, free),
+        "source":          flow.get("source", "tomtom"),
+    }
 
 
 def calculate_eta_for_location(

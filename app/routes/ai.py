@@ -62,7 +62,7 @@ def ai_chat(
 def departure_coach(
     origin: str = Query(..., min_length=2, description="Starting location"),
     destination: str = Query(..., min_length=2, description="Destination"),
-    distance_km: float = Query(..., gt=0, le=500),
+    distance_km: Optional[float] = Query(None, gt=0, le=500, description="Trip distance in km — auto-calculated if omitted"),
     mode: str = Query("driving", description="driving / walking / transit"),
     current_user: Annotated[User, Depends(get_current_user)] = None,
     db: Annotated[Session, Depends(get_db)] = None,
@@ -78,6 +78,22 @@ def departure_coach(
 
     if mode not in {"driving", "walking", "transit"}:
         raise HTTPException(status_code=400, detail="mode must be driving, walking, or transit")
+
+    # Auto-calculate distance if not provided
+    if distance_km is None:
+        try:
+            from app.routes.route import _geocode, _haversine_km
+            orig_loc = _geocode(origin)
+            dest_loc = _geocode(destination)
+            if orig_loc and dest_loc:
+                distance_km = round(_haversine_km(
+                    orig_loc["lat"], orig_loc["lng"],
+                    dest_loc["lat"], dest_loc["lng"],
+                ) * 1.25, 1)
+        except Exception:
+            pass
+        if distance_km is None:
+            distance_km = 10.0
 
     # Gather personal trip history for this route
     trips = (

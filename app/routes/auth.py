@@ -494,70 +494,14 @@ def google_callback(
     token_data = _issue_token(user)
     logger.info("Google callback login: %s", user.email)
 
-    picture_html = (
-        f'<img src="{user.picture_url}" width="72" height="72" '
-        f'style="border-radius:50%;margin-bottom:12px;" /><br/>'
-        if user.picture_url else ""
+    # Redirect to the Next.js frontend so the SPA can store the token
+    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
+    redirect_target = (
+        f"{frontend_url}/auth/google/callback"
+        f"?token={token_data.access_token}"
+        f"&name={user.full_name or ''}"
     )
-
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8"/>
-  <title>FlowCast — Google Login Successful</title>
-  <style>
-    body {{ font-family: 'Segoe UI', sans-serif; background:#f0f4f8; display:flex;
-            justify-content:center; align-items:center; min-height:100vh; margin:0; }}
-    .card {{ background:#fff; border-radius:16px; padding:40px 36px; max-width:540px;
-             width:100%; box-shadow:0 4px 24px rgba(0,0,0,.10); text-align:center; }}
-    h2 {{ color:#22c55e; margin:0 0 4px; }}
-    .sub {{ color:#64748b; font-size:14px; margin-bottom:24px; }}
-    .field {{ text-align:left; margin-bottom:16px; }}
-    label {{ font-size:12px; color:#64748b; font-weight:600; display:block; margin-bottom:4px; }}
-    .value {{ background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px;
-              padding:10px 14px; font-size:13px; color:#1e293b; word-break:break-all; }}
-    .token-box {{ background:#0f172a; color:#4ade80; border-radius:8px; padding:14px;
-                  font-size:12px; font-family:monospace; word-break:break-all;
-                  text-align:left; cursor:pointer; border:none; width:100%; }}
-    .copy-btn {{ margin-top:12px; background:#3b82f6; color:#fff; border:none;
-                 border-radius:8px; padding:10px 24px; font-size:14px; cursor:pointer;
-                 width:100%; font-weight:600; }}
-    .copy-btn:hover {{ background:#2563eb; }}
-    .hint {{ margin-top:20px; font-size:12px; color:#94a3b8; }}
-    .badge {{ display:inline-block; background:#dcfce7; color:#16a34a; border-radius:999px;
-              padding:2px 12px; font-size:12px; font-weight:600; margin-bottom:16px; }}
-  </style>
-</head>
-<body>
-<div class="card">
-  {picture_html}
-  <div class="badge">Google Login Successful</div>
-  <h2>Welcome, {user.full_name}!</h2>
-  <p class="sub">{user.email} &nbsp;·&nbsp; auth_provider: google</p>
-
-  <div class="field">
-    <label>USER ID</label>
-    <div class="value">{user.id}</div>
-  </div>
-
-  <div class="field">
-    <label>ACCESS TOKEN &nbsp;(click to copy)</label>
-    <textarea class="token-box" id="token" rows="5" readonly>{token_data.access_token}</textarea>
-  </div>
-
-  <button class="copy-btn" onclick="navigator.clipboard.writeText(document.getElementById('token').value);this.textContent='Copied!'">
-    Copy Token
-  </button>
-
-  <p class="hint">
-    Paste this token into Swagger UI → <strong>Authorize</strong> button &nbsp;or&nbsp;
-    use it as <code>Authorization: Bearer &lt;token&gt;</code> in your frontend.
-  </p>
-</div>
-</body>
-</html>"""
-
-    return HTMLResponse(content=html, status_code=200)
+    return RedirectResponse(url=redirect_target, status_code=302)
 
 
 @router.post(
