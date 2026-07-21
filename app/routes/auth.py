@@ -424,6 +424,28 @@ _GOOGLE_TOKEN_INFO_URL = "https://oauth2.googleapis.com/tokeninfo"
 _SCOPES = "openid email profile"
 
 
+def _google_redirect_uri() -> str:
+    """Use an explicit callback, or derive the public callback on Render."""
+    configured = (os.getenv("GOOGLE_REDIRECT_URI") or "").strip()
+    if configured:
+        return configured
+
+    render_url = (os.getenv("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
+    if render_url:
+        return f"{render_url}/api/v1/auth/google/callback"
+
+    return "http://localhost:8000/api/v1/auth/google/callback"
+
+
+def _frontend_url() -> str:
+    configured = (os.getenv("FRONTEND_URL") or "").strip()
+    if configured:
+        return configured.rstrip("/")
+    if os.getenv("RENDER_EXTERNAL_URL"):
+        return "https://flowcast-frontend.vercel.app"
+    return "http://localhost:5173"
+
+
 class GoogleTokenRequest(BaseModel):
     """Payload for frontend-initiated Google Sign-In (ID token flow)."""
     id_token: str = Field(..., description="Google ID token from the frontend Sign-In SDK")
@@ -504,7 +526,7 @@ def google_login_url() -> HTMLResponse:
     a proper browser navigation — required by Google OAuth (CORS fetch is blocked).
     """
     client_id    = os.getenv("GOOGLE_CLIENT_ID")
-    redirect_uri = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/api/v1/auth/google/callback")
+    redirect_uri = _google_redirect_uri()
 
     if not client_id or client_id == "your_google_client_id_here":
         raise HTTPException(
@@ -583,7 +605,7 @@ async def google_callback(
     """
     client_id     = os.getenv("GOOGLE_CLIENT_ID")
     client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
-    redirect_uri  = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/api/v1/auth/google/callback")
+    redirect_uri  = _google_redirect_uri()
 
     if not client_id or client_id == "your_google_client_id_here":
         raise HTTPException(status_code=503, detail="Google OAuth not configured.")
@@ -622,7 +644,7 @@ async def google_callback(
     logger.info("Google callback login: %s", user.email)
 
     # Redirect to the Next.js frontend so the SPA can store the token
-    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
+    frontend_url = _frontend_url()
     redirect_target = (
         f"{frontend_url}/auth/google/callback"
         f"?token={token_data.access_token}"
