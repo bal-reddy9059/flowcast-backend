@@ -158,6 +158,7 @@ def congestion_trend(
     )
 
 
+@router.get("/congestion-trend", include_in_schema=False)
 @router.get("/trends")
 def congestion_trends(
     hours: int = Query(24, ge=1, le=72, description="Look-back window in hours"),

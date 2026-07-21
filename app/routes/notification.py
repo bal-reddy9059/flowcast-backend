@@ -426,7 +426,8 @@ async def websocket_notifications_endpoint(websocket: WebSocket, user_id: str) -
             "user_id": connect_key,
             "timestamp": to_ist_iso(),
         }
-        await websocket.send_json(welcome_message)
+        if not await manager.send_to_connection(connect_key, websocket, welcome_message):
+            return
 
         logger.info("User %s connected to WebSocket notifications", connect_key)
 

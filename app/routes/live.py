@@ -101,12 +101,14 @@ async def user_notifications_ws(websocket: WebSocket, user_id: str) -> None:
         aliases=[key for key in (canonical_email, user_id.strip()) if key],
     )
     try:
-        await websocket.send_json({
+        connected = await manager.send_to_connection(canonical_id, websocket, {
             "type": "connected",
             "message": "Connected to FlowCast alerts",
             "user_id": canonical_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
+        if not connected:
+            return
         while True:
             try:
                 data = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)

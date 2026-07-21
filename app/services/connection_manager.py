@@ -5,6 +5,7 @@ Manages active WebSocket connections per user and provides broadcasting
 and targeted message delivery capabilities.
 """
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
@@ -27,6 +28,7 @@ class ConnectionManager:
         self.active_connections: Dict[str, WebSocket] = {}
         # alias key → primary connection key
         self._aliases: Dict[str, str] = {}
+        self._send_locks: Dict[str, asyncio.Lock] = {}
 
     def _normalize(self, key: str) -> str:
         return str(key).strip()
@@ -91,6 +93,7 @@ class ConnectionManager:
         self._aliases = {k: v for k, v in self._aliases.items() if v != primary}
 
         self.active_connections[primary] = websocket
+        self._send_locks.setdefault(primary, asyncio.Lock())
         self._register_aliases(primary, aliases)
 
         if old_ws is not None and old_ws is not websocket and self._is_connected(old_ws):
@@ -114,6 +117,7 @@ class ConnectionManager:
 
         if active is not None and (websocket is None or active is websocket):
             del self.active_connections[primary]
+            self._send_locks.pop(primary, None)
             self._aliases = {k: v for k, v in self._aliases.items() if v != primary}
             logger.info(
                 "User %s disconnected from WebSocket. Total connections: %s",
@@ -134,55 +138,54 @@ class ConnectionManager:
             return False
 
         websocket = self.active_connections[target_key]
-        if not self._is_connected(websocket):
-            self.disconnect(target_key, websocket)
+        return await self.send_to_connection(target_key, websocket, message)
+
+    async def send_to_connection(
+        self,
+        user_id: str,
+        websocket: WebSocket,
+        message: dict,
+    ) -> bool:
+        """Send only if ``websocket`` is still this user's active connection."""
+        target_key = self._resolve_key(user_id)
+        if target_key is None or self.active_connections.get(target_key) is not websocket:
             return False
 
-        try:
-            await websocket.send_json(message)
-            logger.debug("Message sent to user %s (key=%s)", user_id, target_key)
-            return True
-        except WebSocketDisconnect:
-            logger.warning("WebSocket disconnected while sending to user %s", target_key)
-            self.disconnect(target_key, websocket)
-            return False
-        except RuntimeError as error:
-            logger.warning("Runtime error sending to user %s: %s", target_key, error)
-            self.disconnect(target_key, websocket)
-            return False
-        except Exception as error:
-            logger.error("Failed to send message to user %s: %s", target_key, error)
-            self.disconnect(target_key, websocket)
-            return False
+        lock = self._send_locks.setdefault(target_key, asyncio.Lock())
+        async with lock:
+            if (
+                self.active_connections.get(target_key) is not websocket
+                or not self._is_connected(websocket)
+            ):
+                self.disconnect(target_key, websocket)
+                return False
+            try:
+                await websocket.send_json(message)
+                logger.debug("Message sent to user %s (key=%s)", user_id, target_key)
+                return True
+            except (WebSocketDisconnect, RuntimeError) as error:
+                logger.debug("WebSocket closed while sending to user %s: %s", target_key, error)
+                self.disconnect(target_key, websocket)
+                return False
+            except Exception as error:
+                logger.error("Failed to send message to user %s: %s", target_key, error)
+                self.disconnect(target_key, websocket)
+                return False
 
     async def broadcast(self, message: dict) -> None:
         """Send a message to all connected users."""
-        disconnected_users: List[tuple[str, WebSocket]] = []
         user_ids = list(self.active_connections.keys())
+        sent = 0
 
         for uid in user_ids:
-            if uid not in self.active_connections:
-                continue
-            websocket = self.active_connections[uid]
-            if not self._is_connected(websocket):
-                disconnected_users.append((uid, websocket))
-                continue
-            try:
-                await websocket.send_json(message)
-            except WebSocketDisconnect:
-                logger.warning("WebSocket disconnected during broadcast for user %s", uid)
-                disconnected_users.append((uid, websocket))
-            except Exception as error:
-                logger.error("Failed to send broadcast to user %s: %s", uid, error)
-                disconnected_users.append((uid, websocket))
-
-        for uid, websocket in disconnected_users:
-            self.disconnect(uid, websocket)
+            websocket = self.active_connections.get(uid)
+            if websocket is not None and await self.send_to_connection(uid, websocket, message):
+                sent += 1
 
         logger.info(
             "Broadcast sent to %s users (removed %s dead connections)",
-            len(user_ids) - len(disconnected_users),
-            len(disconnected_users),
+            sent,
+            len(user_ids) - sent,
         )
 
     def get_connected_users(self) -> List[str]:
@@ -208,7 +211,10 @@ class ConnectionManager:
             "type": "ping",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-        result = await self.send_to_user(user_id, ping_message)
+        active = self.active_connections.get(target_key)
+        if active is None:
+            return False
+        result = await self.send_to_connection(target_key, active, ping_message)
         if result:
             logger.debug("Ping sent to user %s", user_id)
         return result

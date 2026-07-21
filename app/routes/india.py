@@ -366,6 +366,20 @@ def india_hotspots(
                 recent.append(row)
         recs = (recent or available)[:3]
         if not recs:
+            flow = _simulate_flow(loc["lat"], loc["lng"])
+            current_speed = float(flow["currentSpeed"])
+            free_flow_speed = float(flow["freeFlowSpeed"])
+            level = classify_congestion(current_speed, free_flow_speed)
+            results.append({
+                "location": loc["name"], "city": loc["city"], "state": loc["state"],
+                "lat": loc["lat"], "lng": loc["lng"],
+                "congestion_level": level,
+                "avg_speed_kmh": round(current_speed, 1),
+                "free_flow_speed_kmh": round(free_flow_speed, 1),
+                "vehicle_count": estimate_vehicle_count(current_speed, free_flow_speed),
+                "data_source": "simulated",
+                "_score": _CONGESTION_SCORE.get(level, 0),
+            })
             continue
         latest = recs[0]
         speeds = [r.average_speed for r in recs if r.average_speed]
@@ -377,6 +391,7 @@ def india_hotspots(
             "congestion_level": latest.congestion_level or "low",
             "avg_speed_kmh": round(avg_speed, 1) if avg_speed else None,
             "vehicle_count": latest.vehicle_count,
+            "data_source": "live",
             "_score": score,
         })
 

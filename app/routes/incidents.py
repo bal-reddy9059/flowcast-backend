@@ -255,6 +255,7 @@ def report_incident(
     return {"message": "Incident reported successfully", "incident": _serialize(incident)}
 
 
+@router.get("", include_in_schema=False)
 @router.get(
     "/",
     status_code=status.HTTP_200_OK,
