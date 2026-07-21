@@ -12,6 +12,8 @@ GET /api/v1/traffic/area/cities
 """
 
 import logging
+import threading
+import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from statistics import mean
@@ -104,6 +106,9 @@ _DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"
 _CONGESTION_ORDER = {"low": 0, "medium": 1, "high": 2}
 _SPEED_FOR_CONGESTION = {"low": 45.0, "medium": 28.0, "high": 12.0}
 _LIVE_MAX_AGE = timedelta(hours=6)
+_CITIES_CACHE_TTL_SECONDS = 60.0
+_cities_cache_lock = threading.Lock()
+_cities_cache: tuple[float, dict] | None = None
 
 # Soft prior when history is sparse / uniformly "low"
 _HOUR_PRIOR = {
@@ -664,52 +669,66 @@ async def search_areas(
 
 
 @router.get("/cities", status_code=status.HTTP_200_OK)
-async def list_cities(db: Session = Depends(get_db)) -> dict:
+def list_cities(db: Session = Depends(get_db)) -> dict:
     """List all supported cities with area counts and live traffic summary."""
     from sqlalchemy import or_
+
+    global _cities_cache
+    cache_now = time.monotonic()
+    with _cities_cache_lock:
+        if _cities_cache and cache_now - _cities_cache[0] < _CITIES_CACHE_TTL_SECONDS:
+            return _cities_cache[1]
 
     now   = datetime.now(timezone.utc)
     since = now - _LIVE_MAX_AGE
     cities = []
 
+    all_area_names = [
+        area["name"]
+        for areas in CITY_AREAS.values()
+        for area in areas
+    ]
+    records = (
+        db.query(TrafficRecord)
+        .filter(
+            or_(*[
+                TrafficRecord.location.ilike(f"%{name}%")
+                for name in all_area_names
+            ]),
+            or_(
+                TrafficRecord.timestamp >= since,
+                TrafficRecord.created_at >= since,
+            ),
+            TrafficRecord.congestion_level.isnot(None),
+        )
+        .all()
+    )
+
     for c, areas in CITY_AREAS.items():
         area_names = [a["name"] for a in areas]
+        lowered_names = [name.lower() for name in area_names]
+        city_records = [
+            record for record in records
+            if record.location
+            and any(name in record.location.lower() for name in lowered_names)
+        ]
 
-        records = (
-            db.query(TrafficRecord)
-            .filter(
-                or_(*[TrafficRecord.location.ilike(f"%{n}%") for n in area_names]),
-                or_(
-                    TrafficRecord.timestamp >= since,
-                    TrafficRecord.created_at >= since,
-                ),
-                TrafficRecord.congestion_level.isnot(None),
-            )
-            .all()
-        )
-
-        if records:
-            speeds  = [r.average_speed for r in records if r.average_speed]
-            counts  = Counter(r.congestion_level for r in records)
+        if city_records:
+            speeds  = [r.average_speed for r in city_records if r.average_speed]
+            counts  = Counter(r.congestion_level for r in city_records)
             dominant = counts.most_common(1)[0][0]
             avg_speed = round(mean(speeds), 1) if speeds else None
-            high_pct  = counts.get("high", 0) / len(records) * 100
-            med_pct   = counts.get("medium", 0) / len(records) * 100
+            high_pct  = counts.get("high", 0) / len(city_records) * 100
+            med_pct   = counts.get("medium", 0) / len(city_records) * 100
             health    = round(max(0, 100 - high_pct * 0.6 - med_pct * 0.2), 1)
             data_source = "live"
         else:
-            first = areas[0]
-            snapshot = await _area_live_snapshot(first["name"], c, db, since)
-            if snapshot["data_source"] == "unavailable":
-                dominant = "unknown"
-                avg_speed = None
-                health = None
-                data_source = "unavailable"
-            else:
-                dominant = snapshot["congestion_level"]
-                avg_speed = snapshot["avg_speed_kmh"]
-                health = {"low": 85.0, "medium": 60.0, "high": 30.0}.get(dominant, 60.0)
-                data_source = snapshot["data_source"]
+            # A list endpoint must never make one outbound flow request per
+            # city. Area-specific endpoints can still fetch live data on demand.
+            dominant = "unknown"
+            avg_speed = None
+            health = None
+            data_source = "unavailable"
 
         cities.append({
             "city":               c,
@@ -724,8 +743,11 @@ async def list_cities(db: Session = Depends(get_db)) -> dict:
 
     # None health_score sorts last; higher score first among known cities
     cities.sort(key=lambda x: (x["health_score"] is None, -(x["health_score"] or 0)))
-    return {
+    response = {
         "total_cities": len(cities),
         "generated_at": now.astimezone(_IST).isoformat(),
         "cities": cities,
     }
+    with _cities_cache_lock:
+        _cities_cache = (time.monotonic(), response)
+    return response

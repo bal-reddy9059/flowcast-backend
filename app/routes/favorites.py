@@ -2,6 +2,8 @@
 
 import logging
 import re
+import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
@@ -24,6 +26,9 @@ logger = logging.getLogger(__name__)
 # Only treat readings newer than this as "live"
 _LIVE_MAX_AGE = timedelta(hours=6)
 _STALE_MAX_AGE = timedelta(hours=24)
+_STATUS_CACHE_TTL_SECONDS = 15.0
+_status_cache_lock = threading.Lock()
+_status_cache: dict[tuple[str, ...], tuple[float, dict[str, dict]]] = {}
 
 _SUGGESTED_LOCATIONS = [
     {"name": "Hitech City",   "lat": 17.4486, "lng": 78.3908},
@@ -210,6 +215,13 @@ def _batch_live_status(locations: list[dict], db: Session) -> dict[str, dict]:
     if not locations:
         return {}
 
+    cache_key = tuple(sorted(item["location_name"] for item in locations))
+    cache_now = time.monotonic()
+    with _status_cache_lock:
+        cached = _status_cache.get(cache_key)
+        if cached and cache_now - cached[0] < _STATUS_CACHE_TTL_SECONDS:
+            return cached[1]
+
     now = datetime.now(timezone.utc)
     live_since = now - _LIVE_MAX_AGE
     stale_since = now - _STALE_MAX_AGE
@@ -302,6 +314,13 @@ def _batch_live_status(locations: list[dict], db: Session) -> dict[str, dict]:
                 if is_stale else None
             ),
         }
+    with _status_cache_lock:
+        _status_cache[cache_key] = (time.monotonic(), result)
+        if len(_status_cache) > 256:
+            cutoff = time.monotonic() - _STATUS_CACHE_TTL_SECONDS
+            expired = [key for key, value in _status_cache.items() if value[0] < cutoff]
+            for key in expired:
+                _status_cache.pop(key, None)
     return result
 
 

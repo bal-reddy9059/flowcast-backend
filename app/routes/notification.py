@@ -463,6 +463,10 @@ async def websocket_notifications_endpoint(websocket: WebSocket, user_id: str) -
 
     except WebSocketDisconnect:
         logger.info("User %s WebSocket disconnected during setup", connect_key)
+    except RuntimeError as error:
+        # The browser can close between ASGI accept and the first managed send.
+        # This is a normal disconnect race, not an application failure.
+        logger.debug("WebSocket closed during setup for user %s: %s", connect_key, error)
     except Exception as error:
         logger.error("WebSocket connection failed for user %s: %s", connect_key, error)
     finally:
