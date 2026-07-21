@@ -388,47 +388,34 @@ async def websocket_notifications_endpoint(websocket: WebSocket, user_id: str) -
     """
     WebSocket endpoint for real-time push notifications.
 
-    Path may be email or UUID. Optional ``?token=`` registers both email and UUID
-    aliases so pushes keyed by either identifier reach the client.
+    Path may be the authenticated user's email or UUID. A valid ``?token=`` is
+    required and supplies the canonical identity used for notification delivery.
     """
-    connect_key = user_id.strip()
-    aliases: list[str] = []
-
+    requested_key = user_id.strip()
     token = websocket.query_params.get("token")
-    if token:
-        try:
-            from app.services.auth_service import decode_access_token
-            from app.database import SessionLocal
+    if not token:
+        await websocket.close(code=4401, reason="Authentication required")
+        return
 
-            token_data = decode_access_token(token)
-            if token_data.email:
-                aliases.append(token_data.email)
-            if token_data.user_id:
-                aliases.append(str(token_data.user_id))
-            # Prefer UUID as primary when token provides it
-            if token_data.user_id and "@" in connect_key:
-                aliases.append(connect_key)
-                connect_key = str(token_data.user_id)
-        except Exception as error:
-            logger.debug("WS token alias resolve failed: %s", error)
+    try:
+        from app.services.auth_service import decode_access_token
 
-    # If path is email without token, look up UUID so UUID-keyed pushes still work
-    if "@" in connect_key and str(connect_key) not in aliases:
-        try:
-            from app.database import SessionLocal
-            db = SessionLocal()
-            try:
-                user = db.query(User).filter(User.email.ilike(connect_key)).first()
-                if user:
-                    aliases.append(str(user.id))
-                    aliases.append(user.email)
-            finally:
-                db.close()
-        except Exception as error:
-            logger.debug("WS email→UUID lookup failed: %s", error)
+        token_data = decode_access_token(token)
+    except Exception:
+        await websocket.close(code=4401, reason="Invalid or expired token")
+        return
 
-    if "@" in connect_key:
-        aliases.append(connect_key.lower())
+    canonical_id = str(token_data.user_id or "").strip()
+    canonical_email = str(token_data.email or "").strip()
+    allowed_keys = {
+        key.lower() for key in (canonical_id, canonical_email) if key
+    }
+    if not canonical_id or requested_key.lower() not in allowed_keys:
+        await websocket.close(code=4403, reason="WebSocket identity mismatch")
+        return
+
+    connect_key = canonical_id
+    aliases = [key for key in (canonical_email, requested_key) if key]
 
     try:
         await manager.connect(connect_key, websocket, aliases=aliases)

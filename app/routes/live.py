@@ -75,13 +75,36 @@ async def user_notifications_ws(websocket: WebSocket, user_id: str) -> None:
 
     Keepalive ping is sent every 30 seconds — respond with `"pong"` to acknowledge.
     """
+    from app.services.auth_service import decode_access_token
     from app.services.connection_manager import manager
-    await manager.connect(user_id, websocket)
+
+    token = websocket.query_params.get("token")
+    if not token:
+        await websocket.close(code=4401, reason="Authentication required")
+        return
+    try:
+        token_data = decode_access_token(token)
+    except Exception:
+        await websocket.close(code=4401, reason="Invalid or expired token")
+        return
+
+    canonical_id = str(token_data.user_id or "").strip()
+    canonical_email = str(token_data.email or "").strip()
+    allowed_keys = {key.lower() for key in (canonical_id, canonical_email) if key}
+    if not canonical_id or user_id.strip().lower() not in allowed_keys:
+        await websocket.close(code=4403, reason="WebSocket identity mismatch")
+        return
+
+    await manager.connect(
+        canonical_id,
+        websocket,
+        aliases=[key for key in (canonical_email, user_id.strip()) if key],
+    )
     try:
         await websocket.send_json({
             "type": "connected",
             "message": "Connected to FlowCast alerts",
-            "user_id": user_id,
+            "user_id": canonical_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
         while True:
@@ -90,13 +113,14 @@ async def user_notifications_ws(websocket: WebSocket, user_id: str) -> None:
                 if data == "pong":
                     pass
             except asyncio.TimeoutError:
-                await manager.send_ping(user_id)
+                if not await manager.send_ping(canonical_id, websocket):
+                    break
             except WebSocketDisconnect:
                 break
     except WebSocketDisconnect:
         pass
     finally:
-        manager.disconnect(user_id)
+        manager.disconnect(canonical_id, websocket)
 
 
 # ── Feature 1: Live Car Stream ────────────────────────────────────────────────

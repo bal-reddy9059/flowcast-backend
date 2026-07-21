@@ -95,7 +95,7 @@ class ConnectionManager:
 
         if old_ws is not None and old_ws is not websocket and self._is_connected(old_ws):
             try:
-                await old_ws.close(code=1000, reason="New connection established")
+                await old_ws.close(code=4001, reason="Connection replaced")
             except (RuntimeError, WebSocketDisconnect):
                 logger.debug("Old WebSocket for user %s was already closed", primary)
             except Exception as error:
