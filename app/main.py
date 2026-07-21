@@ -82,7 +82,7 @@ from app.routes.crowd_stations import router as crowd_stations_router
 from app.routes.crowd import router as crowd_router
 from app.routes.crowd_logs import router as crowd_logs_router
 from app.routes.crowd_ws import router as crowd_ws_router
-from app.crowd_db import create_crowd_pool
+from app.crowd_db import create_crowd_pool, ensure_crowd_schema
 from app.services.crowd_service import update_all_crowd as _update_crowd
 from app.utils.crowd_ws_manager import crowd_ws_manager as _crowd_ws_manager
 from app.services.alert_service import check_departure_alerts
@@ -675,11 +675,16 @@ async def lifespan(app: FastAPI):
             logger.warning("Startup migrations skipped: %s", type(exc).__name__)
 
         await asyncio.sleep(2)
+        pool = None
         try:
-            app.state.crowd_pool = await asyncio.wait_for(create_crowd_pool(), timeout=3.0)
+            pool = await asyncio.wait_for(create_crowd_pool(), timeout=3.0)
+            await asyncio.wait_for(ensure_crowd_schema(pool), timeout=8.0)
+            app.state.crowd_pool = pool
             logger.info("Crowd prediction pool ready")
         except Exception as exc:
             logger.warning("Crowd pool unavailable: %s", type(exc).__name__)
+            if pool is not None:
+                await pool.close()
             app.state.crowd_pool = None
 
         light = [
