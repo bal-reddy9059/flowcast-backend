@@ -21,8 +21,17 @@ The Blueprint creates:
 - Automatic deployment on every push to `dev`.
 - A `/health` deployment health check.
 
-The Docker build excludes the tracked local Windows virtual environment and
-copies only `requirements.txt`, `app/`, and `run.py`.
+The Docker build excludes the local Windows virtual environment and copies only
+the UTF-8 `requirements-render.txt` manifest, `app/`, and `run.py`.
+
+If creating a native Python service instead of using the Blueprint, use:
+
+```text
+Build Command: pip install -r requirements-render.txt
+Start Command: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+Health Check Path: /health
+Branch: dev
+```
 
 ## Optional backend variables
 
