@@ -94,6 +94,8 @@ class TrafficMLModel:
         """
         from app.models.predictor import TrafficRecord
 
+        # Cap samples so training never freezes the API server for minutes
+        _MAX_TRAIN_SAMPLES = 8_000
         since = datetime.now(timezone.utc) - timedelta(days=60)
         records = (
             db.query(TrafficRecord)
@@ -101,6 +103,8 @@ class TrafficMLModel:
                 TrafficRecord.created_at >= since,
                 TrafficRecord.congestion_level.in_(["low", "medium", "high"]),
             )
+            .order_by(TrafficRecord.created_at.desc())
+            .limit(_MAX_TRAIN_SAMPLES)
             .all()
         )
 
@@ -135,11 +139,11 @@ class TrafficMLModel:
         y_arr = np.array(y, dtype=np.int32)
 
         clf = RandomForestClassifier(
-            n_estimators=150,
+            n_estimators=80,
             max_depth=10,
             random_state=42,
             class_weight="balanced",
-            n_jobs=-1,
+            n_jobs=1,  # preserve CPU capacity for API requests during retraining
         )
         clf.fit(X_arr, y_arr)
 
@@ -169,7 +173,7 @@ class TrafficMLModel:
         return {
             "ready": self.is_ready(),
             "trained_at": self._trained_at.isoformat() if self._trained_at else None,
-            "model_type": "RandomForestClassifier(n=150,depth=10)" if self.is_ready() else "none",
+            "model_type": "RandomForestClassifier(n=80,depth=10)" if self.is_ready() else "none",
             "training_samples": self._sample_count,
             "features": _FEATURE_NAMES,
             "retrain_interval_hours": 6,

@@ -5,6 +5,7 @@ import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
@@ -18,6 +19,7 @@ from app.services.auth_service import get_current_user
 
 router = APIRouter(prefix="/reports", tags=["Traffic Reports"])
 logger = logging.getLogger(__name__)
+_IST = ZoneInfo("Asia/Kolkata")
 
 
 # ── On-demand reports ─────────────────────────────────────────────────────────
@@ -32,7 +34,7 @@ def daily_summary(
     from app.models.predictor import TrafficRecord, Incident
     from app.services.city_aliases import location_filter
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(_IST)
     since = now - timedelta(hours=24)
     records = (
         db.query(TrafficRecord)
@@ -47,7 +49,10 @@ def daily_summary(
 
     hourly: dict[int, list] = defaultdict(list)
     for r in records:
-        h = r.created_at.hour if r.created_at else 0
+        created = r.created_at
+        if created and created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        h = created.astimezone(_IST).hour if created else 0
         hourly[h].append(r)
 
     hourly_breakdown = []
@@ -83,7 +88,7 @@ def daily_summary(
     return {
         "location": location,
         "report_type": "daily_summary",
-        "period": f"{since.strftime('%Y-%m-%d %H:%M')} – {now.strftime('%Y-%m-%d %H:%M')} UTC",
+        "period": f"{since.strftime('%Y-%m-%d %H:%M')} – {now.strftime('%Y-%m-%d %H:%M')} IST",
         "total_records": len(records),
         "active_incidents": incidents,
         "avg_speed_kmh": round(sum(all_speeds) / len(all_speeds), 1) if all_speeds else None,
@@ -104,12 +109,6 @@ def weekly_trend(
     from collections import defaultdict
     from app.models.predictor import TrafficRecord, Incident
     from app.services.city_aliases import location_filter
-    from app.services.incident_seeder import auto_seed_incidents, seed_week_incidents
-
-    # Ensure today's and past-week's incidents exist before we count them
-    auto_seed_incidents(location, db)
-    seed_week_incidents(location, db)
-
     _sev = {"low": 0, "medium": 1, "high": 2}
 
     def _day_stats(recs: list, incidents_count: int) -> dict:
@@ -126,9 +125,11 @@ def weekly_trend(
         hourly_veh: dict[int, list[int]] = defaultdict(list)
         for r in recs:
             if r.created_at and r.congestion_level:
-                hourly_sev[r.created_at.hour].append(_sev.get(r.congestion_level, 0))
+                created = r.created_at if r.created_at.tzinfo else r.created_at.replace(tzinfo=timezone.utc)
+                hourly_sev[created.astimezone(_IST).hour].append(_sev.get(r.congestion_level, 0))
             if r.created_at and r.vehicle_count is not None:
-                hourly_veh[r.created_at.hour].append(r.vehicle_count)
+                created = r.created_at if r.created_at.tzinfo else r.created_at.replace(tzinfo=timezone.utc)
+                hourly_veh[created.astimezone(_IST).hour].append(r.vehicle_count)
 
         peak_hour: Optional[str] = None
         if hourly_sev:
@@ -147,24 +148,39 @@ def weekly_trend(
             "data_points": len(recs),
         }
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(_IST)
+    week_start = (now - timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
+    week_records = db.query(TrafficRecord).filter(
+        location_filter(TrafficRecord.location, location),
+        TrafficRecord.created_at >= week_start,
+    ).all()
+    week_incidents = db.query(Incident.reported_at).filter(
+        location_filter(Incident.location, location),
+        Incident.reported_at >= week_start,
+    ).all()
+
+    records_by_day: dict = defaultdict(list)
+    for record in week_records:
+        created = record.created_at
+        if created:
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            records_by_day[created.astimezone(_IST).date()].append(record)
+    incidents_by_day: dict = defaultdict(int)
+    for row in week_incidents:
+        reported = row.reported_at
+        if reported:
+            if reported.tzinfo is None:
+                reported = reported.replace(tzinfo=timezone.utc)
+            incidents_by_day[reported.astimezone(_IST).date()] += 1
+
     days = []
     for i in range(6, -1, -1):
         day_start = (now - timedelta(days=i)).replace(hour=0, minute=0, second=0, microsecond=0)
-        day_end   = day_start + timedelta(days=1)
-
-        recs = db.query(TrafficRecord).filter(
-            location_filter(TrafficRecord.location, location),
-            TrafficRecord.created_at >= day_start,
-            TrafficRecord.created_at < day_end,
-        ).all()
-        inc_count = db.query(Incident).filter(
-            location_filter(Incident.location, location),
-            Incident.reported_at >= day_start,
-            Incident.reported_at < day_end,
-        ).count()
-
-        stats = _day_stats(recs, inc_count)
+        stats = _day_stats(
+            records_by_day.get(day_start.date(), []),
+            incidents_by_day.get(day_start.date(), 0),
+        )
         days.append({
             "date": day_start.strftime("%Y-%m-%d"),
             "day_label": day_start.strftime("%a"),
@@ -173,19 +189,18 @@ def weekly_trend(
 
     # ── Today's detailed stats ────────────────────────────────────────────────
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    today_recs  = db.query(TrafficRecord).filter(
-        location_filter(TrafficRecord.location, location),
-        TrafficRecord.created_at >= today_start,
-    ).all()
+    today_recs = records_by_day.get(today_start.date(), [])
 
     # peak congestion % in any single hour today
     hourly_high: dict[int, list] = defaultdict(list)
     hourly_vol:  dict[int, list] = defaultdict(list)
     for r in today_recs:
         if r.created_at:
-            hourly_high[r.created_at.hour].append(r.congestion_level)
+            created = r.created_at if r.created_at.tzinfo else r.created_at.replace(tzinfo=timezone.utc)
+            hour = created.astimezone(_IST).hour
+            hourly_high[hour].append(r.congestion_level)
             if r.vehicle_count is not None:
-                hourly_vol[r.created_at.hour].append(r.vehicle_count)
+                hourly_vol[hour].append(r.vehicle_count)
 
     peak_today_pct = 0.0
     if hourly_high:
@@ -199,10 +214,7 @@ def weekly_trend(
         sum(1 for r in today_recs if r.congestion_level in ("medium", "high")) / n_today * 100, 1
     )
     total_volume  = sum(r.vehicle_count for r in today_recs if r.vehicle_count is not None)
-    incidents_today = db.query(Incident).filter(
-        location_filter(Incident.location, location),
-        Incident.reported_at >= today_start,
-    ).count()
+    incidents_today = incidents_by_day.get(today_start.date(), 0)
 
     # ── Week average congestion % ─────────────────────────────────────────────
     week_avg_pct = round(
@@ -227,22 +239,28 @@ def weekly_trend(
     vs_last_week = round(today_pct - lw_pct, 1)
 
     # ── Peak shift — hour with worst congestion across the full week ──────────
-    week_start = (now - timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
-    week_recs  = db.query(TrafficRecord).filter(
-        location_filter(TrafficRecord.location, location),
-        TrafficRecord.created_at >= week_start,
-    ).all()
+    week_recs = week_records
     week_hourly_sev: dict[int, list] = defaultdict(list)
     for r in week_recs:
         if r.created_at and r.congestion_level:
-            week_hourly_sev[r.created_at.hour].append(_sev.get(r.congestion_level, 0))
+            created = r.created_at if r.created_at.tzinfo else r.created_at.replace(tzinfo=timezone.utc)
+            week_hourly_sev[created.astimezone(_IST).hour].append(_sev.get(r.congestion_level, 0))
     peak_shift: Optional[str] = None
     if week_hourly_sev:
         ph = max(week_hourly_sev, key=lambda h: sum(week_hourly_sev[h]) / len(week_hourly_sev[h]))
         peak_shift = f"{ph:02d}:00"
 
-    worst_day = max(days, key=lambda d: (d["high_congestion_pct"], d["avg_congestion_pct"]))
-    best_day  = min(days, key=lambda d: (d["high_congestion_pct"], d["avg_congestion_pct"]))
+    days_with_data = [day for day in days if day["data_points"] > 0]
+    worst_day = max(
+        days_with_data,
+        key=lambda d: (d["high_congestion_pct"], d["avg_congestion_pct"]),
+        default=None,
+    )
+    best_day = min(
+        days_with_data,
+        key=lambda d: (d["high_congestion_pct"], d["avg_congestion_pct"]),
+        default=None,
+    )
 
     return {
         "location": location,
@@ -293,7 +311,9 @@ def hotspot_analysis(
         )
         .filter(TrafficRecord.created_at >= since, TrafficRecord.congestion_level.isnot(None))
         .group_by(TrafficRecord.location)
-        .having(func.count(TrafficRecord.id) >= 24)   # at least 1 full day of data
+        # Sparse collectors may only have a few samples per location. Requiring
+        # 24 made this report empty even when a full week contained valid data.
+        .having(func.count(TrafficRecord.id) >= 2)
         .order_by(
             # Weight: high=2pts, medium=1pt — gives severity-aware ranking
             (func.sum(case((TrafficRecord.congestion_level == "high",   2), else_=0)) +
@@ -337,7 +357,7 @@ def hotspot_analysis(
         "period_hours": hours,
         "hotspots": hotspots,
         "total": len(hotspots),
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": datetime.now(_IST).isoformat(),
     }
 
 
@@ -358,10 +378,9 @@ def fleet_overview(
     from app.models.fleet import FleetVehicle, FleetAssignment
     from app.models.org import Organization, OrgMembership
     from app.models.predictor import TrafficRecord, Incident
-    from app.services.incident_seeder import auto_seed_incidents
     from app.routes.fleet import _seed_demo_vehicles, _DEMO_VEHICLES
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(_IST)
 
     # ── Resolve or auto-create the user's org ─────────────────────────────────
     membership = db.query(OrgMembership).filter(OrgMembership.user_id == current_user.id).first()
@@ -391,39 +410,46 @@ def fleet_overview(
 
     # ── Real traffic speed for the period ─────────────────────────────────────
     since = now - timedelta(days=days)
-    speed_sample = (
-        db.query(TrafficRecord.average_speed)
+    network_avg_speed = (
+        db.query(func.avg(TrafficRecord.average_speed))
         .filter(TrafficRecord.created_at >= since, TrafficRecord.average_speed.isnot(None))
-        .limit(3000)
-        .all()
+        .scalar()
     )
-    speeds_flat = [r[0] for r in speed_sample]
-    network_avg_speed = sum(speeds_flat) / len(speeds_flat) if speeds_flat else 32.0
+    network_avg_speed = float(network_avg_speed or 32.0)
 
     # Today's traffic stats (for header summary)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    today_recs = (
-        db.query(TrafficRecord)
+    today_stats = (
+        db.query(
+            func.count(TrafficRecord.id).label("total"),
+            func.sum(case((TrafficRecord.congestion_level == "high", 1), else_=0)).label("high"),
+            func.sum(case((TrafficRecord.congestion_level == "medium", 1), else_=0)).label("medium"),
+            func.sum(TrafficRecord.vehicle_count).label("volume"),
+        )
         .filter(TrafficRecord.created_at >= today_start)
-        .all()
+        .one()
     )
-    n_today = len(today_recs) or 1
-    high_today = sum(1 for r in today_recs if r.congestion_level == "high")
-    med_today  = sum(1 for r in today_recs if r.congestion_level == "medium")
+    n_today = int(today_stats.total or 0) or 1
+    high_today = int(today_stats.high or 0)
+    med_today = int(today_stats.medium or 0)
     peak_today_pct = round(high_today / n_today * 100, 1)
     avg_today_pct  = round((high_today + med_today) / n_today * 100, 1)
-    total_volume   = sum(r.vehicle_count for r in today_recs if r.vehicle_count is not None)
+    total_volume = int(today_stats.volume or 0)
 
     # Week congestion avg (for header)
     week_start = today_start - timedelta(days=6)
-    week_recs  = (
-        db.query(TrafficRecord)
+    week_stats = (
+        db.query(
+            func.count(TrafficRecord.id).label("total"),
+            func.sum(case((TrafficRecord.congestion_level == "high", 1), else_=0)).label("high"),
+            func.sum(case((TrafficRecord.congestion_level == "medium", 1), else_=0)).label("medium"),
+        )
         .filter(TrafficRecord.created_at >= week_start, TrafficRecord.congestion_level.isnot(None))
-        .all()
+        .one()
     )
-    all_n     = len(week_recs) or 1
-    week_high = sum(1 for r in week_recs if r.congestion_level == "high")
-    week_med  = sum(1 for r in week_recs if r.congestion_level == "medium")
+    all_n = int(week_stats.total or 0) or 1
+    week_high = int(week_stats.high or 0)
+    week_med = int(week_stats.medium or 0)
     week_avg_pct = round((week_high + week_med) / all_n * 100, 1)
 
     # ── Per-vehicle metric computation ────────────────────────────────────────
@@ -490,22 +516,28 @@ def fleet_overview(
     vs_last_week    = round((today_trips - lw_trips) / max(lw_trips, 1) * 100, 1)
 
     # Peak shift — hour with worst average congestion this week
-    hour_sev: dict[int, list] = defaultdict(list)
-    _sev = {"low": 0, "medium": 1, "high": 2}
-    for r in week_recs:
-        if r.created_at:
-            hour_sev[r.created_at.hour].append(_sev.get(r.congestion_level, 0))
+    hour_expr = func.extract("hour", func.timezone("Asia/Kolkata", TrafficRecord.created_at))
+    severity_expr = case(
+        (TrafficRecord.congestion_level == "high", 2),
+        (TrafficRecord.congestion_level == "medium", 1),
+        else_=0,
+    )
+    hour_rows = (
+        db.query(hour_expr.label("hour"), func.avg(severity_expr).label("severity"))
+        .filter(TrafficRecord.created_at >= week_start)
+        .group_by(hour_expr)
+        .all()
+    )
     peak_shift: Optional[str] = None
-    if hour_sev:
-        ph = max(hour_sev, key=lambda h: sum(hour_sev[h]) / len(hour_sev[h]))
-        peak_shift = f"{ph:02d}:00"
+    if hour_rows:
+        peak_row = max(hour_rows, key=lambda row: float(row.severity or 0))
+        peak_shift = f"{int(peak_row.hour):02d}:00"
 
     # Incidents today (active)
-    auto_seed_incidents("mumbai", db)
-    incidents_today = db.query(Incident).filter(
+    incidents_today = db.query(func.count(func.distinct(Incident.location))).filter(
         Incident.is_active == True,
         Incident.reported_at >= today_start,
-    ).count()
+    ).scalar() or 0
 
     return {
         "report_type": "fleet_overview",
@@ -582,7 +614,7 @@ def fleet_performance(
         "period_days": days,
         "drivers": sorted(driver_stats, key=lambda d: d["trips"], reverse=True),
         "total_drivers": len(driver_stats),
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": datetime.now(_IST).isoformat(),
     }
 
 
@@ -601,7 +633,7 @@ def zone_health_report(
     if not zone:
         raise HTTPException(status_code=404, detail="Zone not found")
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(_IST)
     days = []
     for i in range(6, -1, -1):
         day_start = (now - timedelta(days=i)).replace(hour=0, minute=0, second=0, microsecond=0)

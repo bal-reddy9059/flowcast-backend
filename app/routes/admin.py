@@ -1,4 +1,4 @@
-"""Admin dashboard endpoints for FlowCast system monitoring.
+﻿"""Admin dashboard endpoints for FlowCast system monitoring.
 
 All endpoints require admin authentication.
 """
@@ -39,9 +39,9 @@ def get_system_stats(
     current_user: Annotated[User, Depends(get_current_admin_user)],
     db: Session = Depends(get_db),
 ) -> SystemStats:
-    """System-level overview — users, records, incidents, uptime, WS connections."""
-    # Use naive UTC midnight — DB stores DateTime without timezone info
-    today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    """System-level overview â€” users, records, incidents, uptime, WS connections."""
+    # Use naive UTC midnight â€” DB stores DateTime without timezone info
+    today = datetime.now(timezone.utc).replace(tzinfo=None).replace(hour=0, minute=0, second=0, microsecond=0)
 
     return SystemStats(
         total_users=db.query(func.count(User.id)).scalar() or 0,
@@ -84,7 +84,7 @@ def list_users(
     if active_only:
         query = query.filter(User.is_active.is_(True))
     users = query.order_by(User.created_at.desc()).offset(skip).limit(limit).all()
-    logger.info("Admin user list requested by %s — returned %s", current_user.id, len(users))
+    logger.info("Admin user list requested by %s â€” returned %s", current_user.id, len(users))
     return [UserResponse.model_validate(u) for u in users]
 
 
@@ -92,7 +92,7 @@ def list_users(
 def deactivate_user(
     user_id: uuid.UUID = Path(
         ...,
-        description="User UUID — get this from `GET /api/v1/admin/users` (copy any `id`)",
+        description="User UUID â€” get this from `GET /api/v1/admin/users` (copy any `id`)",
     ),
     current_user: Annotated[User, Depends(get_current_admin_user)] = None,
     db: Session = Depends(get_db),
@@ -117,7 +117,7 @@ def deactivate_user(
 def activate_user(
     user_id: uuid.UUID = Path(
         ...,
-        description="User UUID — get this from `GET /api/v1/admin/users` (copy any `id`)",
+        description="User UUID â€” get this from `GET /api/v1/admin/users` (copy any `id`)",
     ),
     current_user: Annotated[User, Depends(get_current_admin_user)] = None,
     db: Session = Depends(get_db),
@@ -138,7 +138,7 @@ def get_db_stats(
     current_user: Annotated[User, Depends(get_current_admin_user)],
     db: Session = Depends(get_db),
 ) -> DatabaseStats:
-    """Database health — table row counts, DB size, oldest/newest records."""
+    """Database health â€” table row counts, DB size, oldest/newest records."""
     tables = [
         TableInfo(name="users",              row_count=db.query(func.count(User.id)).scalar() or 0),
         TableInfo(name="traffic_records",    row_count=db.query(func.count(TrafficRecord.id)).scalar() or 0),

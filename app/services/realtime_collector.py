@@ -19,11 +19,13 @@ import logging
 import math
 import random
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 from app.database import SessionLocal
 from app.models.predictor import Incident, TrafficRecord
 from app.services.india_locations import INDIA_LOCATIONS
 from app.services import here_traffic_service
+from app.services.traffic_flow_service import REAL_DATA_ONLY
 from app.services.tomtom_service import (
     classify_congestion,
     estimate_vehicle_count,
@@ -36,7 +38,8 @@ logger = logging.getLogger(__name__)
 
 _BATCH_SIZE   = 50     # locations per cycle (TomTom free-tier guard)
 _INTERVAL_SEC = 1800   # 30 min between full collection cycles
-_CALL_DELAY   = 0.3    # seconds between individual API calls
+_PARALLEL     = 8      # concurrent TomTom/HERE calls per cycle
+_STARTUP_DELAY = 90    # let API respond quickly before first heavy collect
 
 
 # ── Simulation fallback ───────────────────────────────────────────────────────
@@ -79,28 +82,54 @@ def _simulate_flow(lat: float, lng: float) -> dict:
 
 # ── Incident upsert ───────────────────────────────────────────────────────────
 
+# ~1.1 km at equator — enough to dedupe the same event reported on nearby road labels
+_INCIDENT_GEO_EPS = 0.01
+
+
 def _upsert_incident(db, location: str, lat: float, lon: float,
                      inc_type: str, severity: str, description: str) -> None:
+    """Insert or refresh an active incident, deduping by type + nearby coordinates."""
     existing = (
         db.query(Incident)
         .filter(
-            Incident.location == location,
             Incident.incident_type == inc_type,
             Incident.is_active.is_(True),
+            Incident.latitude.isnot(None),
+            Incident.longitude.isnot(None),
+            Incident.latitude.between(lat - _INCIDENT_GEO_EPS, lat + _INCIDENT_GEO_EPS),
+            Incident.longitude.between(lon - _INCIDENT_GEO_EPS, lon + _INCIDENT_GEO_EPS),
         )
         .first()
     )
-    if not existing:
-        db.add(Incident(
-            location      = location,
-            latitude      = lat,
-            longitude     = lon,
-            incident_type = inc_type,
-            severity      = severity,
-            description   = description,
-            is_active     = True,
-            reported_at   = datetime.now(timezone.utc),
-        ))
+    if existing is None:
+        existing = (
+            db.query(Incident)
+            .filter(
+                Incident.location == location,
+                Incident.incident_type == inc_type,
+                Incident.is_active.is_(True),
+            )
+            .first()
+        )
+    if existing:
+        existing.severity = severity
+        existing.description = description
+        existing.latitude = lat
+        existing.longitude = lon
+        if location and len(location) > len(existing.location or ""):
+            existing.location = location[:255]
+        return
+
+    db.add(Incident(
+        location      = location[:255],
+        latitude      = lat,
+        longitude     = lon,
+        incident_type = inc_type,
+        severity      = severity,
+        description   = description,
+        is_active     = True,
+        reported_at   = datetime.now(timezone.utc),
+    ))
 
 
 def _upsert_tomtom_incident(db, raw: dict, location_name: str) -> None:
@@ -111,10 +140,14 @@ def _upsert_tomtom_incident(db, raw: dict, location_name: str) -> None:
 
     lon, lat = (coords[0][0], coords[0][1]) if isinstance(coords[0], list) else (coords[0], coords[1])
     category  = props.get("iconCategory", 0)
-    inc_type, severity = parse_incident_type(category)
-
+    # TomTom iconCategory 6/7 are generic events; 0 with no detail is noise.
+    # Skip pure "Jam" descriptions — those are congestion state, not incidents.
     events = props.get("events", [])
     desc   = events[0].get("description", "Traffic incident reported") if events else "Traffic incident"
+    if isinstance(desc, str) and desc.lower().strip() in {"jam", "traffic jam", "congestion"}:
+        return
+
+    inc_type, severity = parse_incident_type(category)
     roads  = ", ".join(props.get("roadNumbers", [])) or location_name
 
     _upsert_incident(db, roads, lat, lon, inc_type, severity, desc)
@@ -152,28 +185,33 @@ async def collect_india_traffic() -> None:
 
         records     = []
         seen_cities: set[str] = set()
+        sem = asyncio.Semaphore(_PARALLEL)
 
-        for loc in batch:
-            flow        = None
-            data_source = "simulated"
-
-            # 1. Try HERE (250K free/month)
-            flow = await here_traffic_service.fetch_flow(loc["lat"], loc["lng"])
-            if flow is not None:
-                data_source = "here"
-
-            # 2. Fall back to TomTom (2,500 free/day)
-            if flow is None:
+        async def _fetch_one(loc: dict) -> tuple[dict, Optional[dict], str]:
+            async with sem:
                 flow = await tomtom_fetch_flow(loc["lat"], loc["lng"])
-                if flow is not None:
-                    data_source = "tomtom"
+                data_source = "tomtom" if flow is not None else "simulated"
+                if flow is None:
+                    flow = await here_traffic_service.fetch_flow(loc["lat"], loc["lng"])
+                    if flow is not None:
+                        data_source = "here"
+                return loc, flow, data_source
 
-            # 3. Fall back to physics simulation
+        fetched = await asyncio.gather(*[_fetch_one(loc) for loc in batch])
+
+        for loc, flow, data_source in fetched:
             if flow is None:
+                if REAL_DATA_ONLY:
+                    logger.debug(
+                        "Skipping %s — no live API data (set REAL_DATA_ONLY=false to allow simulation)",
+                        loc["name"],
+                    )
+                    source_counts["skipped"] = source_counts.get("skipped", 0) + 1
+                    continue
                 flow        = _simulate_flow(loc["lat"], loc["lng"])
                 data_source = "simulated"
 
-            source_counts[data_source] += 1
+            source_counts[data_source] = source_counts.get(data_source, 0) + 1
 
             cur_speed  = float(flow.get("currentSpeed",  35))
             free_speed = float(flow.get("freeFlowSpeed", 60))
@@ -189,21 +227,22 @@ async def collect_india_traffic() -> None:
                 average_speed    = round(cur_speed, 1),
                 congestion_level = congestion,
                 road_type        = loc["road_type"],
+                data_source      = data_source,
                 timestamp        = now,
                 created_at       = now,
             ))
 
             seen_cities.add(loc["city"])
 
-            if _CALL_DELAY > 0:
-                await asyncio.sleep(_CALL_DELAY)
-
         db.bulk_save_objects(records)
         db.commit()
         logger.info(
-            "Inserted %d traffic records  [HERE=%d TomTom=%d simulated=%d]",
+            "Inserted %d traffic records  [HERE=%d TomTom=%d simulated=%d skipped=%d]",
             len(records),
-            source_counts["here"], source_counts["tomtom"], source_counts["simulated"],
+            source_counts.get("here", 0),
+            source_counts.get("tomtom", 0),
+            source_counts.get("simulated", 0),
+            source_counts.get("skipped", 0),
         )
 
         # ── Fetch incidents for each unique city in this batch ────────────────
@@ -248,18 +287,22 @@ async def collect_india_traffic() -> None:
                     db.commit()
                     logger.info("TomTom incidents for %s: %d", city, len(raw_incidents))
 
-        # ── Auto-resolve stale incidents (older than 6 hours) ─────────────────
-        cutoff = now - timedelta(hours=6)
-        stale  = db.query(Incident).filter(
-            Incident.is_active.is_(True),
-            Incident.reported_at < cutoff,
-        ).all()
-        for inc in stale:
-            inc.is_active   = False
-            inc.resolved_at = now
-        if stale:
+        # ── Auto-resolve stale incidents (older than 3 hours) ─────────────────
+        cutoff = now - timedelta(hours=3)
+        stale_q = (
+            db.query(Incident)
+            .filter(
+                Incident.is_active.is_(True),
+                Incident.reported_at < cutoff,
+            )
+        )
+        stale_count = stale_q.update(
+            {"is_active": False, "resolved_at": now},
+            synchronize_session=False,
+        )
+        if stale_count:
             db.commit()
-            logger.info("Auto-resolved %d stale incidents", len(stale))
+            logger.info("Auto-resolved %d stale incidents", stale_count)
 
     except Exception as exc:
         db.rollback()
@@ -275,12 +318,14 @@ def _tomtom_available() -> bool:
 
 
 async def run_india_traffic_collector() -> None:
-    """Infinite loop: collect immediately on startup, then every 30 minutes."""
+    """Infinite loop: delay briefly so API is ready, then collect every 30 minutes."""
+    mode = "HERE → TomTom (real data only)" if REAL_DATA_ONLY else "HERE → TomTom → simulation"
     logger.info(
-        "India real-time traffic collector started (%d locations) — "
-        "source priority: HERE → TomTom → simulation",
+        "India real-time traffic collector started (%d locations) — %s",
         len(INDIA_LOCATIONS),
+        mode,
     )
+    await asyncio.sleep(_STARTUP_DELAY)  # keep HTTP fast during first minute
     while True:
         await collect_india_traffic()
         await asyncio.sleep(_INTERVAL_SEC)

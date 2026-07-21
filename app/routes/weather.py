@@ -9,10 +9,7 @@ GET /weather/status              — cache freshness + OWM configuration status
 """
 
 import logging
-import os
 import uuid
-from datetime import datetime, timezone
-from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, status
 
@@ -21,14 +18,13 @@ from app.services.weather_service import (
     get_cached_weather_by_id,
     get_city_id_map,
     get_monitored_cities,
+    get_cache_meta,
     weather_impact_for_location,
-    city_uuid,
 )
+from app.utils.api_response import to_ist_iso
 
 router = APIRouter(prefix="/weather", tags=["Weather & Traffic Impact"])
 logger = logging.getLogger(__name__)
-
-_OWM_KEY = os.getenv("OPENWEATHERMAP_API_KEY", "")
 
 _MODIFIER_LABEL = {
     "none":     "No weather impact — normal driving conditions",
@@ -74,8 +70,9 @@ def get_all_cities_weather() -> dict:
     """
     raw = get_all_cached()
     if not raw:
+        # Should not happen after ensure_weather_cache — keep a safe empty shape
         return {
-            "message": "Weather cache is warming up — try again in 30 seconds.",
+            "message": "Weather data unavailable.",
             "cities": [],
             "total": 0,
         }
@@ -102,7 +99,7 @@ def get_all_cities_weather() -> dict:
             "normal"
         ),
         "cities":        snapshots,
-        "generated_at":  datetime.now(timezone.utc).isoformat(),
+        "generated_at":  to_ist_iso(),
         "tip": "Use city_id from each entry to call GET /weather/city/{city_id}",
     }
 
@@ -213,17 +210,27 @@ def get_location_weather_impact(
 )
 def get_weather_status() -> dict:
     """Shows cache freshness, data source, and OpenWeatherMap configuration."""
-    cached = get_all_cached()
+    meta = get_cache_meta()
     id_map = get_city_id_map()
+    # Prefer Hyderabad as the sample city when present
+    sample_id = next(
+        (cid for cid, name in id_map.items() if name == "Hyderabad"),
+        next(iter(id_map), None),
+    )
     return {
-        "owm_configured":          bool(_OWM_KEY),
-        "data_source":             "openweathermap" if _OWM_KEY else "simulated",
-        "cities_cached":           len(cached),
-        "cities_monitored":        len(get_monitored_cities()),
+        "owm_configured":           meta["owm_configured"],
+        "data_source":              meta["data_source"],
+        "cities_cached":            meta["cities_cached"],
+        "cities_monitored":         len(get_monitored_cities()),
+        "last_fetch_at":            meta["last_fetch_at"],
         "refresh_interval_minutes": 30,
-        "city_id_directory_url":   "/api/v1/weather/city-ids",
-        "sample_city_id":          list(id_map.keys())[0] if id_map else None,
-        "sample_city_url":         f"/api/v1/weather/city/{list(id_map.keys())[0]}" if id_map else None,
+        "city_id_directory_url":    "/api/v1/weather/city-ids",
+        "sample_city_id":           sample_id,
+        "sample_city_url":          f"/api/v1/weather/city/{sample_id}" if sample_id else None,
+        "hint": (
+            "Set OPENWEATHERMAP_API_KEY for live OpenWeatherMap data; "
+            "without it the API returns deterministic simulated weather."
+        ),
     }
 
 

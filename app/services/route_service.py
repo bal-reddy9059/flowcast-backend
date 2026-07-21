@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 
 from app.models.predictor import TrafficRecord
 from app.schemas.route import RouteSegment
+from app.utils.http_client import get_http_client
 
 logger = logging.getLogger(__name__)
 
@@ -69,17 +70,16 @@ async def get_route_from_google(
         "key": api_key,
     }
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            response = await client.get(url, params=params)
-            response.raise_for_status()
-            data = response.json()
-        except httpx.HTTPError as e:
-            logger.error("Google Maps API call failed: %s", e)
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Google Maps API unavailable",
-            )
+    try:
+        response = await get_http_client().get(url, params=params)
+        response.raise_for_status()
+        data = response.json()
+    except httpx.HTTPError as e:
+        logger.error("Google Maps API call failed: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Google Maps API unavailable",
+        )
 
     if data.get("status") == "ZERO_RESULTS":
         logger.warning("No route found between %s,%s and %s,%s", origin_lat, origin_lng, dest_lat, dest_lng)
@@ -151,17 +151,16 @@ async def get_route_from_ors(
         "instructions": True,
     }
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        try:
-            response = await client.post(url, json=body, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-        except httpx.HTTPError as e:
-            logger.error("ORS API call failed: %s", e)
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Routing service unavailable",
-            )
+    try:
+        response = await get_http_client().post(url, json=body, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+    except httpx.HTTPError as e:
+        logger.error("ORS API call failed: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Routing service unavailable",
+        )
 
     feature = data["features"][0]
     props = feature["properties"]

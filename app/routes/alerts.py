@@ -2,7 +2,7 @@
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, List, Optional, Union
 from zoneinfo import ZoneInfo
 
@@ -21,15 +21,59 @@ logger = logging.getLogger(__name__)
 _DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 _DAY_FULL  = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 _DAY_MAP   = {name: i for i, name in enumerate(_DAY_FULL)}
+# Also accept short forms from the API / frontend
+_DAY_MAP.update({abbr.lower(): i for i, abbr in enumerate(_DAY_NAMES)})
+_DAY_MAP.update({"tues": 1, "thur": 3, "thurs": 3})
 _IST = ZoneInfo("Asia/Kolkata")
 
 
-def _to_ist(dt: datetime) -> str:
+def _to_ist(dt: datetime) -> Optional[str]:
     if dt is None:
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(_IST).isoformat()
+
+
+def _estimate_distance_km(origin: str, destination: str) -> Optional[float]:
+    """Geocode both ends and return road-ish km (haversine × 1.25), or None."""
+    try:
+        from app.routes.route import _geocode, _haversine_km
+    except Exception:
+        return None
+    o = _geocode(origin)
+    d = _geocode(destination)
+    if not o or not d:
+        return None
+    straight = _haversine_km(o["lat"], o["lng"], d["lat"], d["lng"])
+    return round(straight * 1.25, 1)
+
+
+def _next_trigger_ist(alert: DepartureAlert, now: Optional[datetime] = None) -> Optional[str]:
+    """Next IST datetime when this alert should fire (departure − notice)."""
+    now = now or datetime.now(_IST)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=_IST)
+    else:
+        now = now.astimezone(_IST)
+
+    try:
+        dep_h, dep_m = map(int, alert.departure_time.split(":"))
+    except Exception:
+        return None
+    notice = alert.advance_notice_minutes or 15
+    scheduled = {int(d) for d in alert.days_of_week.split(",") if d.strip().isdigit()}
+    if not scheduled:
+        return None
+
+    for offset in range(0, 8):
+        day = now + timedelta(days=offset)
+        if day.weekday() not in scheduled:
+            continue
+        fire = day.replace(hour=dep_h, minute=dep_m, second=0, microsecond=0) - timedelta(minutes=notice)
+        if fire > now:
+            return fire.isoformat()
+    return None
 
 
 class AlertCreate(BaseModel):
@@ -39,8 +83,8 @@ class AlertCreate(BaseModel):
     destination_name: Optional[str] = Field(None, min_length=2, max_length=200)
     origin: Optional[str] = Field(None, min_length=2, max_length=200)
     destination: Optional[str] = Field(None, min_length=2, max_length=200)
-    departure_time: str = Field(..., description="HH:MM")
-    # Accept integers [0-6] OR day-name strings ['monday', ...]
+    departure_time: str = Field(..., description="HH:MM (Asia/Kolkata)")
+    # Accept integers [0-6] OR day-name strings ['monday', 'Mon', ...]
     days_of_week: List[Union[int, str]] = Field(...)
     advance_notice_minutes: int = Field(15, ge=5, le=120)
     mode: str = Field("driving")
@@ -74,7 +118,7 @@ class AlertCreate(BaseModel):
         converted = []
         for d in v:
             if isinstance(d, str):
-                idx = _DAY_MAP.get(d.lower())
+                idx = _DAY_MAP.get(d.lower().strip())
                 if idx is None:
                     raise ValueError(f"Unknown day name: {d!r}. Use monday–sunday or 0–6.")
                 converted.append(idx)
@@ -84,7 +128,7 @@ class AlertCreate(BaseModel):
                 converted.append(d)
             else:
                 raise ValueError(f"days_of_week items must be strings or integers, got {type(d)}")
-        return list(set(converted))
+        return sorted(set(converted))
 
     @field_validator("mode")
     @classmethod
@@ -95,15 +139,16 @@ class AlertCreate(BaseModel):
 
 
 def _fmt_alert(a: DepartureAlert) -> dict:
-    indices = [int(d) for d in a.days_of_week.split(",") if d]
+    indices = [int(d) for d in a.days_of_week.split(",") if d.strip().isdigit()]
     days_abbr = [_DAY_NAMES[i] for i in indices]
     days_full = [_DAY_FULL[i] for i in indices]
     result = {
-        "id":                     a.id,
+        "id":                     str(a.id),
         "route_name":             a.route_name,
         "origin":                 a.origin_name,
         "destination":            a.destination_name,
         "departure_time":         a.departure_time,
+        "timezone":               "Asia/Kolkata",
         "days":                   days_abbr,
         "days_of_week":           days_full,
         "advance_notice_minutes": a.advance_notice_minutes,
@@ -111,6 +156,7 @@ def _fmt_alert(a: DepartureAlert) -> dict:
         "distance_km":            a.distance_km,
         "is_active":              a.is_active,
         "created_at":             _to_ist(a.created_at),
+        "next_trigger_at":        _next_trigger_ist(a) if a.is_active else None,
     }
     if a.last_triggered_at is not None:
         result["last_triggered_at"] = _to_ist(a.last_triggered_at)
@@ -126,9 +172,9 @@ def create_alert(
     """Create a departure time alert.
 
     The background task will send you a WebSocket notification
-    `advance_notice_minutes` before your scheduled departure on the configured days.
+    `advance_notice_minutes` before your scheduled departure on the configured days
+    (times are interpreted in Asia/Kolkata).
     """
-    # Prevent duplicate alerts: same route_name + departure_time per user
     existing = db.query(DepartureAlert).filter(
         DepartureAlert.user_id == current_user.id,
         DepartureAlert.route_name == payload.route_name,
@@ -151,6 +197,10 @@ def create_alert(
             detail="origin (or origin_name) and destination (or destination_name) are required",
         )
 
+    distance_km = payload.distance_km
+    if distance_km is None:
+        distance_km = _estimate_distance_km(origin_name, destination_name)
+
     days_str = ",".join(str(d) for d in sorted(payload.days_of_week))
     alert = DepartureAlert(
         user_id=current_user.id,
@@ -161,15 +211,21 @@ def create_alert(
         days_of_week=days_str,
         advance_notice_minutes=payload.advance_notice_minutes,
         mode=payload.mode,
-        distance_km=payload.distance_km,
+        distance_km=distance_km,
     )
     db.add(alert)
     db.commit()
     db.refresh(alert)
-    logger.info("User %s created departure alert '%s' at %s", current_user.id, payload.route_name, payload.departure_time)
+    logger.info(
+        "User %s created departure alert '%s' at %s IST",
+        current_user.id, payload.route_name, payload.departure_time,
+    )
     return {
         **_fmt_alert(alert),
-        "message": f"Alert set — you'll be notified {payload.advance_notice_minutes} min before {payload.departure_time}",
+        "message": (
+            f"Alert set — you'll be notified {payload.advance_notice_minutes} min "
+            f"before {payload.departure_time} IST"
+        ),
     }
 
 
@@ -196,14 +252,16 @@ def _do_toggle(alert_id: uuid.UUID, current_user: User, db: Session) -> dict:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Alert not found")
     alert.is_active = not alert.is_active
     db.commit()
+    db.refresh(alert)
     state = "enabled" if alert.is_active else "disabled"
     logger.info("User %s %s departure alert %s", current_user.id, state, alert_id)
     return {
-        "id":             alert_id,
-        "route_name":     alert.route_name,
-        "departure_time": alert.departure_time,
-        "is_active":      alert.is_active,
-        "message":        f"Alert '{alert.route_name}' {state}",
+        "id":              str(alert.id),
+        "route_name":      alert.route_name,
+        "departure_time":  alert.departure_time,
+        "is_active":       alert.is_active,
+        "next_trigger_at": _next_trigger_ist(alert) if alert.is_active else None,
+        "message":         f"Alert '{alert.route_name}' {state}",
     }
 
 
@@ -243,4 +301,4 @@ def delete_alert(
     db.delete(alert)
     db.commit()
     logger.info("User %s deleted departure alert %s", current_user.id, alert_id)
-    return {"message": "Alert deleted", "id": alert_id}
+    return {"message": "Alert deleted", "id": str(alert_id)}

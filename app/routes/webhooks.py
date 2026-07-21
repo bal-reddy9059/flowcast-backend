@@ -794,9 +794,8 @@ async def list_webhooks(
     """
     Return all webhooks registered by the current user.
 
-    **First call:** auto-creates 3 demo webhooks pointing to `https://httpbin.org/post`
-    and fires a test ping to each — so `total_deliveries` and `last_triggered_at`
-    are immediately populated with real data.
+    **First call:** auto-creates 3 demo webhooks pointing to `https://httpbin.org/post`.
+    Delivery is only attempted through the explicit test endpoint or event queue.
     """
     webhooks = db.query(Webhook).filter(Webhook.user_id == current_user.id).all()
 
@@ -805,26 +804,6 @@ async def list_webhooks(
     if not webhooks:
         webhooks = _seed_demo_webhooks(current_user, db)
         freshly_seeded = True
-
-    # Fire a test ping for each webhook that has never been tested
-    untested = [wh for wh in webhooks if (wh.total_deliveries or 0) == 0 and wh.is_active]
-    if untested:
-        for wh in untested:
-            try:
-                ping_payload = {
-                    "event":      "test",
-                    "message":    "FlowCast auto-test ping — verifying endpoint is reachable.",
-                    "webhook_id": str(wh.id),
-                    "name":       wh.name,
-                    "url":        wh.url,
-                    "events":     wh.events.split(","),
-                    "timestamp":  datetime.now(timezone.utc).isoformat(),
-                    "sent_by":    "FlowCast auto-test",
-                }
-                await deliver_webhook(wh, "test", ping_payload, db)
-                db.refresh(wh)
-            except Exception as exc:
-                logger.warning("Auto-test ping failed for webhook %s: %s", wh.id, exc)
 
     result = [_webhook_dict(wh, db=db) for wh in webhooks]
 
@@ -846,7 +825,7 @@ async def list_webhooks(
                                      if total_deliveries else 0.0,
         },
         "available_events": list(_EVENT_DESCRIPTIONS.keys()),
-        "auto_tested": freshly_seeded,
+        "auto_tested": False,
         "tip": (
             "Demo webhooks point to httpbin.org/post (public echo). "
             "Replace with your real endpoint URL via PUT /webhooks/{id}."
@@ -866,32 +845,11 @@ async def get_webhook(
     """
     Get full webhook detail with live delivery statistics and the last 5 delivery attempts.
 
-    If this webhook has never been tested, a **test ping is auto-fired** to your endpoint
-    so `recent_deliveries`, `last_triggered_at`, and `stats` are immediately populated
-    with real data rather than zeros.
+    This read endpoint never performs outbound delivery. Use the explicit test endpoint.
     """
     wh = _get_webhook_or_404(webhook_id, current_user.id, db)
 
-    # Auto-fire test ping if this webhook has never been delivered
     auto_tested = False
-    if (wh.total_deliveries or 0) == 0 and wh.is_active:
-        try:
-            ping_payload = {
-                "event":      "test",
-                "message":    "FlowCast auto-test ping — verifying your endpoint is reachable.",
-                "webhook_id": str(wh.id),
-                "name":       wh.name,
-                "url":        wh.url,
-                "events":     wh.events.split(","),
-                "timestamp":  datetime.now(timezone.utc).isoformat(),
-                "sent_by":    "FlowCast auto-test (triggered by GET detail)",
-            }
-            await deliver_webhook(wh, "test", ping_payload, db)
-            db.refresh(wh)
-            auto_tested = True
-            logger.info("Auto-test ping sent for webhook %s", wh.id)
-        except Exception as exc:
-            logger.warning("Auto-test ping failed for webhook %s: %s", wh.id, exc)
 
     # Build unified response — _webhook_dict(db=db) already includes stats + recent_deliveries
     result = _webhook_dict(wh, db=db)
@@ -998,8 +956,7 @@ async def delivery_log(
     """
     Last 50 delivery attempts with status codes, timestamps, and human-readable error details.
 
-    **Auto-fires a test ping** if this webhook has never been tested, so the log is
-    never returned empty on the first call.
+    This read endpoint never performs outbound delivery, so a new log may be empty.
 
     - `attempted_at`  — when the HTTP request was made (never null)
     - `status_label`  — `success` / `failed` / `pending`
@@ -1010,26 +967,7 @@ async def delivery_log(
 
     wh = _get_webhook_or_404(webhook_id, current_user.id, db)
 
-    # ── Auto-fire test ping when log is empty ─────────────────────────────────
     auto_tested = False
-    if (wh.total_deliveries or 0) == 0 and wh.is_active:
-        try:
-            ping_payload = {
-                "event":      "test",
-                "message":    "FlowCast auto-test ping — verifying your endpoint is reachable.",
-                "webhook_id": str(wh.id),
-                "name":       wh.name,
-                "url":        wh.url,
-                "events":     wh.events.split(","),
-                "timestamp":  datetime.now(timezone.utc).isoformat(),
-                "sent_by":    "FlowCast auto-test (triggered by GET deliveries)",
-            }
-            await deliver_webhook(wh, "test", ping_payload, db)
-            db.refresh(wh)
-            auto_tested = True
-            logger.info("Auto-test ping sent for webhook %s (delivery log was empty)", wh.id)
-        except Exception as exc:
-            logger.warning("Auto-test ping failed for webhook %s: %s", wh.id, exc)
 
     # ── Fetch delivery records ────────────────────────────────────────────────
     deliveries = (

@@ -18,6 +18,7 @@ from app.services.eta_service import (
     get_speed_for_congestion,
     TRAFFIC_CONDITIONS,
 )
+from app.utils.api_response import api_success, to_ist_iso
 
 router = APIRouter(tags=["Live Traffic"])
 logger = logging.getLogger(__name__)
@@ -216,18 +217,16 @@ async def start_live_trip(payload: LiveTripStart) -> dict:
     """
     session_id = str(uuid.uuid4())
 
-    # 1. Try to fetch live traffic data directly from HERE / TomTom for the origin
-    live   = await fetch_live_location_flow(payload.origin)
-    source = "database_cache"
-
-    # 2. Fall back to DB cache (used as base, then overridden below if live data landed)
+    # 1. DB cache first (instant) — never block the client on live APIs
     db = SessionLocal()
     try:
         eta = calculate_eta_for_location(payload.origin, payload.distance_km, payload.mode, db)
     finally:
         db.close()
+    source = "database_cache"
 
-    # 3. If live data arrived, recalculate ETA with the real speed (more accurate than DB cache)
+    # 2. Soft live upgrade — max ~1.5s, then keep DB values
+    live = await fetch_live_location_flow(payload.origin)
     if live:
         mode_cap   = get_speed_for_congestion(live["congestion_level"], payload.mode)
         real_speed = min(live["speed_kmh"], mode_cap) if live["speed_kmh"] > 0 else mode_cap
@@ -253,17 +252,27 @@ async def start_live_trip(payload: LiveTripStart) -> dict:
         "last_congestion": eta.congestion_level,
         "last_speed":     eta.average_speed_kmh,
     }
-    return {
-        "session_id":          session_id,
-        "origin":              payload.origin,
-        "destination":         payload.destination,
-        "initial_eta_minutes": eta.eta_minutes,
-        "congestion_level":    eta.congestion_level,
-        "speed_kmh":           eta.average_speed_kmh,
-        "data_source":         source,
-        "ws_url":              f"/api/v1/trips/ws/{session_id}",
-        "started_at":          datetime.now(timezone.utc).isoformat(),
-    }
+    return api_success(
+        data={
+            "session_id":           session_id,
+            "origin":               payload.origin,
+            "destination":          payload.destination,
+            "distance_km":          payload.distance_km,
+            "mode":                 payload.mode,
+            "initial_eta_minutes":  round(float(eta.eta_minutes), 1),
+            "eta_with_buffer_minutes": round(float(eta.eta_with_buffer_minutes), 1)
+                                      if getattr(eta, "eta_with_buffer_minutes", None) else None,
+            "congestion_level":     eta.congestion_level,
+            "speed_kmh":            round(float(eta.average_speed_kmh or 0), 1),
+            "traffic_condition":    getattr(eta, "traffic_condition", None),
+            "confidence":           getattr(eta, "confidence", None),
+            "data_source":          source,
+            "ws_url":               f"/api/v1/trips/ws/{session_id}",
+            "ws_full_url":          f"ws://localhost:8000/api/v1/trips/ws/{session_id}",
+            "started_at":           to_ist_iso(),
+        },
+        message="Live trip session started. Connect to ws_url for ETA updates every 15 seconds.",
+    )
 
 
 @router.websocket("/trips/ws/{session_id}")
@@ -276,12 +285,15 @@ async def live_trip_ws(websocket: WebSocket, session_id: str) -> None:
     Message format:
     ```json
     {
+      "success": true,
       "type": "eta_update",
-      "eta_minutes": 18.5,
-      "congestion_level": "medium",
-      "speed_kmh": 34.2,
-      "trend": "improving",
-      "updated_at": "2026-05-28T10:00:15+00:00"
+      "data": {
+        "eta_minutes": 18.5,
+        "congestion_level": "medium",
+        "speed_kmh": 34.2,
+        "trend": "improving"
+      },
+      "timestamp": "2026-07-14T19:00:15+05:30"
     }
     ```
     """
@@ -294,18 +306,27 @@ async def live_trip_ws(websocket: WebSocket, session_id: str) -> None:
     session["websocket"] = websocket
 
     try:
-        await websocket.send_json({
-            "type": "trip_connected",
-            "session_id": session_id,
-            "origin": session["origin"],
-            "destination": session["destination"],
-            "message": "Live ETA updates will arrive every 15 seconds.",
-        })
+        await websocket.send_json(api_success(
+            data={
+                "session_id": session_id,
+                "origin": session["origin"],
+                "destination": session["destination"],
+                "initial_eta_minutes": session.get("last_eta"),
+                "congestion_level": session.get("last_congestion"),
+                "speed_kmh": session.get("last_speed"),
+            },
+            message="Live ETA updates will arrive every 15 seconds.",
+            type="trip_connected",
+        ))
         _MAX_DURATION = 4 * 3600
         while True:
             elapsed = (datetime.now(timezone.utc) - session["started_at"]).total_seconds()
             if elapsed > _MAX_DURATION:
-                await websocket.send_json({"type": "session_expired", "message": "4-hour session limit reached."})
+                await websocket.send_json(api_success(
+                    data={"session_id": session_id},
+                    message="4-hour session limit reached.",
+                    type="session_expired",
+                ))
                 break
             try:
                 await asyncio.wait_for(websocket.receive_text(), timeout=15.0)
@@ -327,7 +348,10 @@ def end_live_trip(session_id: str) -> dict:
     if session_id not in _live_sessions:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
     del _live_sessions[session_id]
-    return {"message": "Trip session ended", "session_id": session_id}
+    return api_success(
+        data={"session_id": session_id},
+        message="Trip session ended",
+    )
 
 
 # ── Feature 4: Traffic Pulse Feed ─────────────────────────────────────────────
@@ -430,6 +454,131 @@ async def ml_live_ws(websocket: WebSocket) -> None:
     _TOP_N = 30          # send top N locations per tick
     _TICK_SECONDS = 5    # push interval
 
+    def _build_payload(tick_start: datetime) -> dict:
+        from datetime import timedelta
+        from app.models.predictor import TrafficRecord, Incident as IncidentModel
+        from app.services.india_locations import INDIA_LOCATIONS
+        from app.services.ml_prediction_service import ml_model
+
+        db = SessionLocal()
+        try:
+            since = tick_start - timedelta(minutes=10)
+            records = (
+                db.query(TrafficRecord)
+                .filter(TrafficRecord.created_at >= since)
+                .order_by(TrafficRecord.created_at.desc())
+                .limit(_TOP_N * 3)
+                .all()
+            )
+
+            seen: dict[str, TrafficRecord] = {}
+            for r in records:
+                if r.location not in seen:
+                    seen[r.location] = r
+
+            if len(seen) < 5:
+                from app.services.realtime_collector import _simulate_flow
+                from app.services.tomtom_service import classify_congestion, estimate_vehicle_count
+                for loc in INDIA_LOCATIONS[:_TOP_N]:
+                    if loc["name"] not in seen:
+                        flow = _simulate_flow(loc["lat"], loc["lng"])
+                        cur = float(flow["currentSpeed"])
+                        free = float(flow["freeFlowSpeed"])
+                        seen[loc["name"]] = type("FakeRec", (), {
+                            "location": loc["name"],
+                            "congestion_level": classify_congestion(cur, free),
+                            "average_speed": cur,
+                            "vehicle_count": estimate_vehicle_count(cur, free),
+                            "created_at": tick_start,
+                            "_city": loc.get("city", ""),
+                        })()
+
+            now_hour = tick_start.hour
+            now_dow = tick_start.weekday()
+            location_rows = []
+            congestion_counts: dict[str, int] = {"low": 0, "medium": 0, "high": 0}
+
+            for loc_name, rec in list(seen.items())[:_TOP_N]:
+                age_min = None
+                if hasattr(rec, "created_at") and rec.created_at:
+                    ts = rec.created_at
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    age_min = round((tick_start - ts).total_seconds() / 60, 1)
+
+                vc = float(rec.vehicle_count or 500)
+                spd = float(rec.average_speed or 35)
+                cong = rec.congestion_level or "medium"
+                congestion_counts[cong] = congestion_counts.get(cong, 0) + 1
+
+                forecast = ml_model.predict_hours_ahead(
+                    base_hour=now_hour,
+                    base_dow=now_dow,
+                    vehicle_count=vc,
+                    average_speed=spd,
+                    hours_ahead=3,
+                )
+
+                location_rows.append({
+                    "name": loc_name,
+                    "city": getattr(rec, "_city", ""),
+                    "congestion_level": cong,
+                    "avg_speed_kmh": round(spd, 1),
+                    "vehicle_count": int(vc),
+                    "data_age_minutes": age_min,
+                    "ml_forecast": forecast,
+                })
+
+            active_incidents = (
+                db.query(IncidentModel)
+                .filter(IncidentModel.is_active == True)
+                .order_by(IncidentModel.reported_at.desc())
+                .limit(20)
+                .all()
+            )
+            incident_list = [
+                {
+                    "id": i.id,
+                    "location": i.location,
+                    "incident_type": i.incident_type,
+                    "severity": i.severity,
+                    "upvotes": i.upvotes or 0,
+                    "downvotes": i.downvotes or 0,
+                    "reported_at": i.reported_at.isoformat() if i.reported_at else None,
+                    "expires_at": i.expires_at.isoformat() if i.expires_at else None,
+                }
+                for i in active_incidents
+            ]
+
+            total_locs = len(location_rows)
+            high_pct = round(congestion_counts.get("high", 0) / max(total_locs, 1) * 100, 1)
+            future_high = sum(
+                1 for row in location_rows
+                if row["ml_forecast"] and row["ml_forecast"][0]["predicted_congestion"] == "high"
+            )
+            future_high_pct = round(future_high / max(total_locs, 1) * 100, 1)
+
+            if future_high_pct > high_pct + 5:
+                network_trend = "worsening"
+            elif future_high_pct < high_pct - 5:
+                network_trend = "improving"
+            else:
+                network_trend = "stable"
+
+            return {
+                "type": "ml_live_update",
+                "timestamp": tick_start.isoformat(),
+                "model_ready": ml_model.is_ready(),
+                "locations": location_rows,
+                "incidents": incident_list,
+                "network_trend": network_trend,
+                "high_congestion_pct": high_pct,
+                "future_high_pct_1h": future_high_pct,
+                "total_locations": total_locs,
+            }
+        finally:
+            db.close()
+
     try:
         await websocket.send_json({
             "type": "ml_live_connected",
@@ -444,136 +593,9 @@ async def ml_live_ws(websocket: WebSocket) -> None:
 
         while True:
             tick_start = datetime.now(timezone.utc)
-            db = SessionLocal()
-            try:
-                # ── 1. Fetch latest record per location (last 10 min) ───────────
-                since = tick_start - __import__("datetime").timedelta(minutes=10)
-                records = (
-                    db.query(TrafficRecord)
-                    .filter(TrafficRecord.created_at >= since)
-                    .order_by(TrafficRecord.created_at.desc())
-                    .limit(_TOP_N * 3)   # over-fetch to deduplicate per location
-                    .all()
-                )
+            payload = await asyncio.to_thread(_build_payload, tick_start)
+            await websocket.send_json(payload)
 
-                # Deduplicate: keep only the latest record per location
-                seen: dict[str, TrafficRecord] = {}
-                for r in records:
-                    if r.location not in seen:
-                        seen[r.location] = r
-
-                # If DB is sparse, fall back to INDIA_LOCATIONS simulation
-                if len(seen) < 5:
-                    from app.services.realtime_collector import _simulate_flow
-                    from app.services.tomtom_service import classify_congestion, estimate_vehicle_count
-                    for loc in INDIA_LOCATIONS[:_TOP_N]:
-                        if loc["name"] not in seen:
-                            flow = _simulate_flow(loc["lat"], loc["lng"])
-                            cur  = float(flow["currentSpeed"])
-                            free = float(flow["freeFlowSpeed"])
-                            seen[loc["name"]] = type("FakeRec", (), {
-                                "location":        loc["name"],
-                                "congestion_level": classify_congestion(cur, free),
-                                "average_speed":    cur,
-                                "vehicle_count":    estimate_vehicle_count(cur, free),
-                                "created_at":       tick_start,
-                                "_city":            loc.get("city", ""),
-                            })()
-
-                # ── 2. Build per-location payload with ML forecast ────────────
-                now_hour = tick_start.hour
-                now_dow  = tick_start.weekday()
-                location_rows = []
-                congestion_counts: dict[str, int] = {"low": 0, "medium": 0, "high": 0}
-
-                for loc_name, rec in list(seen.items())[:_TOP_N]:
-                    age_min = None
-                    if hasattr(rec, "created_at") and rec.created_at:
-                        ts = rec.created_at
-                        if ts.tzinfo is None:
-                            ts = ts.replace(tzinfo=__import__("datetime").timezone.utc)
-                        age_min = round((tick_start - ts).total_seconds() / 60, 1)
-
-                    vc  = float(rec.vehicle_count or 500)
-                    spd = float(rec.average_speed or 35)
-                    cong = rec.congestion_level or "medium"
-                    congestion_counts[cong] = congestion_counts.get(cong, 0) + 1
-
-                    forecast = ml_model.predict_hours_ahead(
-                        base_hour=now_hour,
-                        base_dow=now_dow,
-                        vehicle_count=vc,
-                        average_speed=spd,
-                        hours_ahead=3,
-                    )
-
-                    location_rows.append({
-                        "name":              loc_name,
-                        "city":              getattr(rec, "_city", ""),
-                        "congestion_level":  cong,
-                        "avg_speed_kmh":     round(spd, 1),
-                        "vehicle_count":     int(vc),
-                        "data_age_minutes":  age_min,
-                        "ml_forecast":       forecast,
-                    })
-
-                # ── 3. Active incidents ────────────────────────────────────────
-                active_incidents = (
-                    db.query(IncidentModel)
-                    .filter(IncidentModel.is_active == True)
-                    .order_by(IncidentModel.reported_at.desc())
-                    .limit(20)
-                    .all()
-                )
-                incident_list = [
-                    {
-                        "id":            i.id,
-                        "location":      i.location,
-                        "incident_type": i.incident_type,
-                        "severity":      i.severity,
-                        "upvotes":       i.upvotes or 0,
-                        "downvotes":     i.downvotes or 0,
-                        "reported_at":   i.reported_at.isoformat() if i.reported_at else None,
-                        "expires_at":    i.expires_at.isoformat() if i.expires_at else None,
-                    }
-                    for i in active_incidents
-                ]
-
-                # ── 4. Network-wide trend ─────────────────────────────────────
-                total_locs = len(location_rows)
-                high_pct = round(congestion_counts.get("high", 0) / max(total_locs, 1) * 100, 1)
-
-                # Compare current high% to what ML predicts in 1h
-                future_high = sum(
-                    1 for row in location_rows
-                    if row["ml_forecast"] and row["ml_forecast"][0]["predicted_congestion"] == "high"
-                )
-                future_high_pct = round(future_high / max(total_locs, 1) * 100, 1)
-
-                if future_high_pct > high_pct + 5:
-                    network_trend = "worsening"
-                elif future_high_pct < high_pct - 5:
-                    network_trend = "improving"
-                else:
-                    network_trend = "stable"
-
-                # ── 5. Send payload ───────────────────────────────────────────
-                await websocket.send_json({
-                    "type":              "ml_live_update",
-                    "timestamp":         tick_start.isoformat(),
-                    "model_ready":       ml_model.is_ready(),
-                    "locations":         location_rows,
-                    "incidents":         incident_list,
-                    "network_trend":     network_trend,
-                    "high_congestion_pct":  high_pct,
-                    "future_high_pct_1h": future_high_pct,
-                    "total_locations":   total_locs,
-                })
-
-            finally:
-                db.close()
-
-            # Sleep for the remainder of the tick window
             elapsed = (datetime.now(timezone.utc) - tick_start).total_seconds()
             sleep_for = max(0.1, _TICK_SECONDS - elapsed)
             try:

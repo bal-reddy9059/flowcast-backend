@@ -6,18 +6,16 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
-import httpx
 from urllib.parse import urlencode
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.user import User
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
-from collections import Counter
 from datetime import timedelta as _td
 from typing import Optional
 
@@ -27,11 +25,14 @@ from app.models.route import SavedRoute
 from app.schemas.user import TokenResponse, UserCreate, UserLogin, UserResponse
 from app.services.auth_service import (
     ACCESS_TOKEN_EXPIRE_MINUTES,
-    create_access_token,
     get_current_user,
     hash_password,
+    issue_access_token,
     verify_password,
 )
+
+from app.utils.api_response import to_ist_iso
+from app.utils.http_client import get_http_client
 
 logger = logging.getLogger(__name__)
 
@@ -39,12 +40,94 @@ router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 
 class ProfileUpdate(BaseModel):
+    """Accept full_name or common frontend aliases (name / display_name)."""
+
     full_name: Optional[str] = Field(None, min_length=2, max_length=100)
+    name: Optional[str] = Field(None, min_length=2, max_length=100)
+    display_name: Optional[str] = Field(None, min_length=2, max_length=100)
     password: Optional[str] = Field(None, min_length=8, max_length=100)
 
-    model_config = ConfigDict(json_schema_extra={
-        "example": {"full_name": "Ravi Kumar", "password": "NewSecurePass123"}
-    })
+    model_config = ConfigDict(
+        str_strip_whitespace=True,
+        extra="ignore",
+        json_schema_extra={
+            "example": {"full_name": "Ravi Kumar", "password": "NewSecurePass123"}
+        },
+    )
+
+    def resolved_full_name(self) -> Optional[str]:
+        for value in (self.full_name, self.name, self.display_name):
+            if value is not None and value.strip():
+                return value.strip()
+        return None
+
+
+def _user_public(user: User) -> dict:
+    """Consistent user payload for /me, dashboard, and clients that expect `.name`."""
+    display = (user.full_name or "").strip() or (user.email or "").split("@")[0] or "User"
+    initial = display[0].upper() if display else "U"
+    return {
+        "id": str(user.id),
+        "email": user.email,
+        # snake_case
+        "full_name": display,
+        "name": display,
+        "display_name": display,
+        "avatar_initial": initial,
+        "picture_url": user.picture_url,
+        "is_active": bool(user.is_active),
+        "is_admin": bool(user.is_admin),
+        "is_verified": bool(user.is_verified),
+        "auth_provider": user.auth_provider or "local",
+        "last_login": to_ist_iso(user.last_login) if user.last_login else None,
+        "created_at": to_ist_iso(user.created_at) if user.created_at else None,
+        # camelCase aliases (common in React UIs)
+        "fullName": display,
+        "displayName": display,
+        "avatarInitial": initial,
+        "pictureUrl": user.picture_url,
+        "isActive": bool(user.is_active),
+        "isAdmin": bool(user.is_admin),
+        "isVerified": bool(user.is_verified),
+        "authProvider": user.auth_provider or "local",
+    }
+
+
+def _apply_profile_update(
+    payload: ProfileUpdate,
+    current_user: User,
+    db: Session,
+) -> User:
+    new_name = payload.resolved_full_name()
+    if new_name is None and payload.password is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide at least one field to update: full_name (or name) or password",
+        )
+    if new_name is not None:
+        current_user.full_name = new_name
+    if payload.password is not None:
+        current_user.hashed_password = hash_password(payload.password)
+    db.commit()
+    db.refresh(current_user)
+    logger.info("Profile updated for user %s → full_name=%s", current_user.id, current_user.full_name)
+    return current_user
+
+
+def _profile_response(user: User) -> dict:
+    """Profile payload + fresh JWT so the header picks up the new name immediately."""
+    pub = _user_public(user)
+    access_token = issue_access_token(
+        user,
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+    )
+    return {
+        **pub,
+        "user": pub,
+        "access_token": access_token,
+        "token_type": "bearer",
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+    }
 
 
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
@@ -73,8 +156,8 @@ def register_user(
     db.commit()
     db.refresh(user)
 
-    access_token = create_access_token(
-        {"sub": user.email, "user_id": str(user.id)},
+    access_token = issue_access_token(
+        user,
         expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
     )
 
@@ -123,8 +206,8 @@ def login_user(
     db.commit()
     db.refresh(user)
 
-    access_token = create_access_token(
-        {"sub": user.email, "user_id": str(user.id)},
+    access_token = issue_access_token(
+        user,
         expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
     )
 
@@ -137,32 +220,45 @@ def login_user(
     )
 
 
-@router.get("/me", response_model=UserResponse, status_code=status.HTTP_200_OK)
-def get_profile(current_user: Annotated[User, Depends(get_current_user)]) -> UserResponse:
-    """Get current authenticated user profile."""
-    return UserResponse.model_validate(current_user)
+@router.get("/me", status_code=status.HTTP_200_OK)
+def get_profile(current_user: Annotated[User, Depends(get_current_user)]) -> dict:
+    """Get current authenticated user profile (includes name aliases for the UI)."""
+    pub = _user_public(current_user)
+    # Flat fields + nested `user` so both data.name and data.user.name work
+    return {**pub, "user": pub}
 
 
-@router.patch("/profile", response_model=UserResponse, status_code=status.HTTP_200_OK)
+@router.patch("/profile", status_code=status.HTTP_200_OK)
 def update_profile(
     payload: ProfileUpdate,
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
-) -> UserResponse:
+) -> dict:
     """Update the authenticated user's full name and/or password."""
-    if payload.full_name is None and payload.password is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Provide at least one field to update: full_name or password",
-        )
-    if payload.full_name is not None:
-        current_user.full_name = payload.full_name.strip()
-    if payload.password is not None:
-        current_user.hashed_password = hash_password(payload.password)
-    db.commit()
-    db.refresh(current_user)
-    logger.info("Profile updated for user %s", current_user.id)
-    return UserResponse.model_validate(current_user)
+    user = _apply_profile_update(payload, current_user, db)
+    return _profile_response(user)
+
+
+@router.put("/profile", status_code=status.HTTP_200_OK)
+def put_profile(
+    payload: ProfileUpdate,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict:
+    """PUT alias for profile update (same body as PATCH)."""
+    user = _apply_profile_update(payload, current_user, db)
+    return _profile_response(user)
+
+
+@router.post("/profile", status_code=status.HTTP_200_OK)
+def post_profile(
+    payload: ProfileUpdate,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict:
+    """POST alias for profile update (same body as PATCH)."""
+    user = _apply_profile_update(payload, current_user, db)
+    return _profile_response(user)
 
 
 @router.get("/dashboard", status_code=status.HTTP_200_OK)
@@ -174,7 +270,7 @@ def get_user_dashboard(
     now = datetime.now(timezone.utc)
     since_1h = now - _td(hours=1)
 
-    # Saved routes with latest nearby traffic
+    # Saved routes plus one batched recent-traffic lookup for every route origin.
     saved_routes = (
         db.execute(
             __import__("sqlalchemy", fromlist=["select"]).select(SavedRoute).where(
@@ -185,19 +281,40 @@ def get_user_dashboard(
         .scalars()
         .all()
     )
-    routes_status = []
-    for route in saved_routes:
-        record = (
+    route_filters = [
+        and_(
+            TrafficRecord.latitude.between(route.origin_lat - 0.02, route.origin_lat + 0.02),
+            TrafficRecord.longitude.between(route.origin_lng - 0.02, route.origin_lng + 0.02),
+        )
+        for route in saved_routes
+        if route.origin_lat is not None and route.origin_lng is not None
+    ]
+    nearby_records = []
+    if route_filters:
+        nearby_records = (
             db.query(TrafficRecord)
             .filter(
-                TrafficRecord.latitude.between(route.origin_lat - 0.02, route.origin_lat + 0.02),
-                TrafficRecord.longitude.between(route.origin_lng - 0.02, route.origin_lng + 0.02),
+                TrafficRecord.created_at >= now - _td(hours=24),
+                or_(*route_filters),
             )
             .order_by(TrafficRecord.created_at.desc())
-            .first()
+            .all()
+        )
+
+    routes_status = []
+    for route in saved_routes:
+        record = next(
+            (
+                item for item in nearby_records
+                if route.origin_lat is not None
+                and route.origin_lng is not None
+                and abs((item.latitude or 999) - route.origin_lat) <= 0.02
+                and abs((item.longitude or 999) - route.origin_lng) <= 0.02
+            ),
+            None,
         )
         routes_status.append({
-            "route_id": route.id,
+            "route_id": str(route.id),
             "route_name": route.route_name,
             "origin": route.origin_name,
             "destination": route.destination_name,
@@ -212,30 +329,40 @@ def get_user_dashboard(
     )
     active_incidents = db.query(Incident).filter(Incident.is_active == True).count()
 
-    # City health score from last hour
-    recent = db.query(TrafficRecord).filter(
-        TrafficRecord.created_at >= since_1h,
-        TrafficRecord.congestion_level.isnot(None),
-    ).all()
-    if recent:
-        counts = Counter(r.congestion_level for r in recent)
-        total = len(recent)
-        health_score = round(max(0, 100 - counts.get("high", 0) / total * 70 - counts.get("medium", 0) / total * 25), 1)
-    else:
-        health_score = 100
+    # Calculate health in SQL; avoid loading every observation into Python.
+    def health_counts(since: datetime):
+        return (
+            db.query(
+                func.count(TrafficRecord.id).label("total"),
+                func.sum(case((TrafficRecord.congestion_level == "high", 1), else_=0)).label("high"),
+                func.sum(case((TrafficRecord.congestion_level == "medium", 1), else_=0)).label("medium"),
+            )
+            .filter(
+                TrafficRecord.created_at >= since,
+                TrafficRecord.congestion_level.isnot(None),
+            )
+            .one()
+        )
+
+    health_row = health_counts(since_1h)
+    health_period_hours = 1
+    if not int(health_row.total or 0):
+        health_period_hours = 6
+        health_row = health_counts(now - _td(hours=health_period_hours))
+    total = int(health_row.total or 0)
+    health_score = (
+        round(max(0, 100 - int(health_row.high or 0) / total * 70 - int(health_row.medium or 0) / total * 25), 1)
+        if total else None
+    )
 
     return {
-        "user": {
-            "id": current_user.id,
-            "full_name": current_user.full_name,
-            "email": current_user.email,
-            "is_verified": current_user.is_verified,
-        },
+        "user": _user_public(current_user),
         "unread_notifications": unread_notifications,
         "active_incidents_citywide": active_incidents,
         "city_health_score": health_score,
+        "health_period_hours": health_period_hours,
         "saved_routes": routes_status,
-        "generated_at": now.isoformat(),
+        "generated_at": to_ist_iso(now),
     }
 
 
@@ -273,8 +400,8 @@ def setup_admin(
 @router.post("/refresh", response_model=TokenResponse, status_code=status.HTTP_200_OK)
 def refresh_token(current_user: Annotated[User, Depends(get_current_user)]) -> TokenResponse:
     """Refresh JWT access token before expiry."""
-    access_token = create_access_token(
-        {"sub": current_user.email, "user_id": str(current_user.id)},
+    access_token = issue_access_token(
+        current_user,
         expires_delta=timedelta(minutes=30),
     )
 
@@ -312,7 +439,7 @@ def _get_or_create_google_user(db: Session, google_info: dict) -> User:
     # 1. Existing Google account
     user = db.query(User).filter(User.google_id == google_id).first()
     if user:
-        user.last_login = datetime.utcnow()
+        user.last_login = datetime.now(timezone.utc).replace(tzinfo=None)
         user.picture_url = picture
         db.commit()
         db.refresh(user)
@@ -325,7 +452,7 @@ def _get_or_create_google_user(db: Session, google_info: dict) -> User:
         user.auth_provider = "google"
         user.picture_url   = picture
         user.is_verified   = True
-        user.last_login    = datetime.utcnow()
+        user.last_login    = datetime.now(timezone.utc).replace(tzinfo=None)
         db.commit()
         db.refresh(user)
         logger.info("Linked Google account to existing user %s", email)
@@ -341,7 +468,7 @@ def _get_or_create_google_user(db: Session, google_info: dict) -> User:
         picture_url    = picture,
         is_active      = True,
         is_verified    = True,
-        last_login     = datetime.utcnow(),
+        last_login     = datetime.now(timezone.utc).replace(tzinfo=None),
     )
     db.add(user)
     db.commit()
@@ -351,8 +478,8 @@ def _get_or_create_google_user(db: Session, google_info: dict) -> User:
 
 
 def _issue_token(user: User) -> TokenResponse:
-    access_token = create_access_token(
-        {"sub": user.email, "user_id": str(user.id)},
+    access_token = issue_access_token(
+        user,
         expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
     )
     return TokenResponse(
@@ -444,7 +571,7 @@ def google_login_url() -> HTMLResponse:
     summary="Google OAuth Callback",
     tags=["Authentication"],
 )
-def google_callback(
+async def google_callback(
     code: str,
     db: Session = Depends(get_db),
 ) -> HTMLResponse:
@@ -463,13 +590,13 @@ def google_callback(
 
     # Exchange authorization code for tokens
     try:
-        token_resp = httpx.post(_GOOGLE_TOKEN_URL, data={
+        token_resp = await get_http_client().post(_GOOGLE_TOKEN_URL, data={
             "code":          code,
             "client_id":     client_id,
             "client_secret": client_secret,
             "redirect_uri":  redirect_uri,
             "grant_type":    "authorization_code",
-        }, timeout=10)
+        }, timeout=0.9)
         token_resp.raise_for_status()
         tokens = token_resp.json()
     except Exception as exc:
@@ -478,9 +605,9 @@ def google_callback(
 
     # Fetch user info using the access token
     try:
-        info_resp = httpx.get(_GOOGLE_USERINFO_URL, headers={
+        info_resp = await get_http_client().get(_GOOGLE_USERINFO_URL, headers={
             "Authorization": f"Bearer {tokens['access_token']}"
-        }, timeout=10)
+        }, timeout=0.9)
         info_resp.raise_for_status()
         google_info = info_resp.json()
     except Exception as exc:
@@ -511,7 +638,7 @@ def google_callback(
     summary="Verify Google ID Token (Frontend Flow)",
     tags=["Authentication"],
 )
-def google_token_login(
+async def google_token_login(
     payload: GoogleTokenRequest,
     db: Session = Depends(get_db),
 ) -> TokenResponse:
@@ -532,10 +659,10 @@ def google_token_login(
 
     # Verify the ID token with Google
     try:
-        resp = httpx.get(
+        resp = await get_http_client().get(
             _GOOGLE_TOKEN_INFO_URL,
             params={"id_token": payload.id_token},
-            timeout=10,
+            timeout=0.9,
         )
         resp.raise_for_status()
         google_info = resp.json()

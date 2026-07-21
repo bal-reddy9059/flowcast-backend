@@ -2,22 +2,34 @@ import asyncio
 import logging
 import os
 import traceback
+import warnings
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+# Suppress utcnow() deprecation warnings that come from third-party packages
+# (SQLAlchemy, Pydantic) — we have no control over those call sites.
+warnings.filterwarnings(
+    "ignore",
+    message="datetime.datetime.utcnow\\(\\) is deprecated",
+    category=DeprecationWarning,
+    module=r"(sqlalchemy|pydantic).*",
+)
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import OperationalError, TimeoutError as SQLAlchemyTimeoutError
+from starlette.middleware.gzip import GZipMiddleware
 
 load_dotenv()
 
-from app.database import Base, SessionLocal, engine, migrate_users_id_to_uuid, migrate_routes_id_to_uuid, migrate_favorites_id_to_uuid, migrate_notifications_id_to_uuid, migrate_trips_id_to_uuid, migrate_alerts_id_to_uuid, run_column_migrations, seed_admin_user, test_connection
+from app.database import Base, SessionLocal, engine, run_startup_migrations, cleanup_stale_db_backends, seed_admin_user, test_connection
 from app.core.rate_limiter import setup_rate_limiter
 
 # ── Explicit model imports so create_all() sees every table ──────────────────
 from app.models.user import User                                     # noqa: F401
-from app.models.predictor import TrafficRecord, Incident, PredictionResult  # noqa: F401
+from app.models.predictor import TrafficRecord, Incident, IncidentVote, PredictionResult  # noqa: F401
 from app.models.route import SavedRoute                              # noqa: F401
 from app.models.notification import Notification                     # noqa: F401
 from app.models.favorite import FavoriteLocation                     # noqa: F401
@@ -66,6 +78,13 @@ from app.routes.india import router as india_router
 from app.routes.india_ws import router as india_ws_router
 from app.routes.prediction import router as prediction_router
 from app.routes.trips import router as trips_router
+from app.routes.crowd_stations import router as crowd_stations_router
+from app.routes.crowd import router as crowd_router
+from app.routes.crowd_logs import router as crowd_logs_router
+from app.routes.crowd_ws import router as crowd_ws_router
+from app.crowd_db import create_crowd_pool
+from app.services.crowd_service import update_all_crowd as _update_crowd
+from app.utils.crowd_ws_manager import crowd_ws_manager as _crowd_ws_manager
 from app.services.alert_service import check_departure_alerts
 from app.services.connection_manager import manager as ws_manager
 from app.services.notification_service import check_saved_routes_for_congestion
@@ -74,25 +93,24 @@ from app.services.district_collector import run_district_collector, set_broadcas
 
 logger = logging.getLogger(__name__)
 
-migrate_users_id_to_uuid()
-migrate_routes_id_to_uuid()
-migrate_favorites_id_to_uuid()
-migrate_notifications_id_to_uuid()
-migrate_trips_id_to_uuid()
-migrate_alerts_id_to_uuid()
-Base.metadata.create_all(bind=engine)
-seed_admin_user()
+def _ensure_schema() -> None:
+    """Create tables + seed admin. Safe to call from a worker thread."""
+    Base.metadata.create_all(bind=engine)
+    seed_admin_user()
 
 
 async def _congestion_monitor():
     """Check every saved route for high congestion every 60 seconds."""
     while True:
         try:
-            db = SessionLocal()
+            def _open_db():
+                return SessionLocal()
+
+            db = await asyncio.to_thread(_open_db)
             try:
                 await check_saved_routes_for_congestion(db, ws_manager)
             finally:
-                db.close()
+                await asyncio.to_thread(db.close)
         except Exception as exc:
             logger.error("Congestion monitor error: %s", exc)
         await asyncio.sleep(60)
@@ -114,12 +132,18 @@ async def _car_tick_broadcaster():
     from app.services.car_simulator import car_simulator
     tick_count = 0
     if not car_simulator._initialized:
-        car_simulator.initialize_from_locations()
+        try:
+            await asyncio.to_thread(car_simulator.initialize_from_locations)
+        except Exception as exc:
+            logger.warning("Car simulator init deferred: %s", type(exc).__name__)
+            # Seed empty so tick loop never crashes; refresh will retry later
+            car_simulator._initialized = True
+            car_simulator._cars = {}
     while True:
         try:
-            car_simulator.tick()
+            await asyncio.to_thread(car_simulator.tick)
             if _car_sockets:
-                snapshot = car_simulator.get_snapshot()
+                snapshot = await asyncio.to_thread(car_simulator.get_snapshot)
                 await _broadcast_cars({
                     "type": "cars_update",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -128,7 +152,7 @@ async def _car_tick_broadcaster():
                 })
             tick_count += 1
             if tick_count >= 900:  # 30 min at 2-s intervals
-                car_simulator.refresh_from_db()
+                await asyncio.to_thread(car_simulator.refresh_from_db)
                 tick_count = 0
         except Exception as exc:
             logger.error("Car tick broadcaster error: %s", exc)
@@ -139,6 +163,31 @@ async def _live_trip_updater():
     """Recalculate ETA for every active live trip every 15 s and push via WebSocket."""
     from app.routes.live import _live_sessions
     from app.services.eta_service import calculate_eta_for_location as _calc_eta
+    from app.utils.api_response import api_success
+
+    def _tick(session: dict) -> dict | None:
+        db = SessionLocal()
+        try:
+            eta = _calc_eta(session["origin"], session["distance_km"], session["mode"], db)
+            prev_eta = session.get("last_eta") or eta.eta_minutes
+            if eta.eta_minutes < prev_eta * 0.95:
+                trend = "improving"
+            elif eta.eta_minutes > prev_eta * 1.05:
+                trend = "worsening"
+            else:
+                trend = "stable"
+            session["last_eta"] = eta.eta_minutes
+            session["last_congestion"] = eta.congestion_level
+            session["last_speed"] = eta.average_speed_kmh
+            return {
+                "eta_minutes": round(eta.eta_minutes, 1),
+                "congestion_level": eta.congestion_level,
+                "speed_kmh": round(float(eta.average_speed_kmh or 0), 1),
+                "trend": trend,
+            }
+        finally:
+            db.close()
+
     while True:
         await asyncio.sleep(15)
         if not _live_sessions:
@@ -147,34 +196,16 @@ async def _live_trip_updater():
             ws = session.get("websocket")
             if ws is None:
                 continue
-            db = SessionLocal()
             try:
-                eta = _calc_eta(session["origin"], session["distance_km"], session["mode"], db)
-                prev_eta = session.get("last_eta") or eta.eta_minutes
-                if eta.eta_minutes < prev_eta * 0.95:
-                    trend = "improving"
-                elif eta.eta_minutes > prev_eta * 1.05:
-                    trend = "worsening"
-                else:
-                    trend = "stable"
-                session["last_eta"] = eta.eta_minutes
-                session["last_congestion"] = eta.congestion_level
-                session["last_speed"] = eta.average_speed_kmh
-                try:
-                    await ws.send_json({
-                        "type": "eta_update",
-                        "eta_minutes": round(eta.eta_minutes, 1),
-                        "congestion_level": eta.congestion_level,
-                        "speed_kmh": round(eta.average_speed_kmh, 1),
-                        "trend": trend,
-                        "updated_at": datetime.now(timezone.utc).isoformat(),
-                    })
-                except Exception:
-                    pass
+                update = await asyncio.to_thread(_tick, session)
+                if update is None:
+                    continue
+                await ws.send_json(api_success(
+                    data={"session_id": session_id, **update},
+                    type="eta_update",
+                ))
             except Exception as exc:
                 logger.error("Live trip updater error for session %s: %s", session_id, exc)
-            finally:
-                db.close()
 
 
 async def _traffic_pulse_monitor():
@@ -182,25 +213,41 @@ async def _traffic_pulse_monitor():
     from app.routes.live import _broadcast_pulse, _pulse_prev_state
     from app.models.predictor import TrafficRecord
     from app.services.india_locations import INDIA_LOCATIONS
+
     _LEVELS = {"low": 0, "medium": 1, "high": 2}
-    while True:
-        await asyncio.sleep(60)
+
+    def _scan() -> list[dict]:
+        events: list[dict] = []
         db = SessionLocal()
         try:
+            names = [loc["name"] for loc in INDIA_LOCATIONS]
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=6)
+            rows = (
+                db.query(TrafficRecord)
+                .filter(
+                    TrafficRecord.location.in_(names),
+                    TrafficRecord.timestamp >= cutoff,
+                )
+                # PostgreSQL DISTINCT ON: one latest row per location instead
+                # of loading the entire traffic history every minute.
+                .distinct(TrafficRecord.location)
+                .order_by(TrafficRecord.location, TrafficRecord.timestamp.desc())
+                .all()
+            )
+            latest = {row.location: row for row in rows}
+
             for loc in INDIA_LOCATIONS:
                 name = loc["name"]
-                record = (
-                    db.query(TrafficRecord)
-                    .filter(TrafficRecord.location == name)
-                    .order_by(TrafficRecord.created_at.desc())
-                    .first()
-                )
+                record = latest.get(name)
                 if record is None:
                     continue
                 cur_congestion = record.congestion_level or "medium"
                 cur_speed = float(record.average_speed or 0)
                 prev = _pulse_prev_state.get(name)
-                _pulse_prev_state[name] = {"congestion_level": cur_congestion, "average_speed": cur_speed}
+                _pulse_prev_state[name] = {
+                    "congestion_level": cur_congestion,
+                    "average_speed": cur_speed,
+                }
                 if prev is None:
                     continue
                 prev_congestion = prev["congestion_level"]
@@ -215,7 +262,7 @@ async def _traffic_pulse_monitor():
                 elif prev_speed > 0 and cur_speed > prev_speed * 1.2:
                     event = "speed_recovery"
                 if event:
-                    await _broadcast_pulse({
+                    events.append({
                         "type": "pulse_event",
                         "event": event,
                         "location": name,
@@ -225,10 +272,17 @@ async def _traffic_pulse_monitor():
                         "speed_kmh": round(cur_speed, 1),
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     })
-        except Exception as exc:
-            logger.error("Traffic pulse monitor error: %s", exc)
         finally:
             db.close()
+        return events
+
+    while True:
+        await asyncio.sleep(60)
+        try:
+            for msg in await asyncio.to_thread(_scan):
+                await _broadcast_pulse(msg)
+        except Exception as exc:
+            logger.error("Traffic pulse monitor error: %s", exc)
 
 
 async def _zone_alert_monitor():
@@ -246,7 +300,9 @@ async def _zone_alert_monitor():
             zones = db.query(GeofenceZone).filter(GeofenceZone.is_active == True).all()
             now = datetime.now(timezone.utc)
             for zone in zones:
-                locations, avg_speed, dominant = _query_zone_traffic(zone, db)
+                locations, avg_speed, dominant, has_data = _query_zone_traffic(zone, db)
+                if not has_data or dominant in ("unknown", None, ""):
+                    continue
                 if _CONGESTION_SCORE.get(dominant, 0) < _CONGESTION_SCORE.get(zone.congestion_threshold, 2):
                     continue
 
@@ -256,7 +312,7 @@ async def _zone_alert_monitor():
                     db.query(ZoneAlert)
                     .filter(
                         ZoneAlert.zone_id == zone.id,
-                        ZoneAlert.triggered_at >= cooldown_cutoff,
+                        ZoneAlert.triggered_at >= cooldown_cutoff.replace(tzinfo=None),
                     )
                     .first()
                 )
@@ -265,9 +321,10 @@ async def _zone_alert_monitor():
 
                 alert = ZoneAlert(
                     zone_id=zone.id,
+                    triggered_at=now.replace(tzinfo=None),
                     congestion_level=dominant,
                     affected_locations=_json.dumps([l["name"] for l in locations]),
-                    avg_speed_kmh=avg_speed,
+                    avg_speed_kmh=round(avg_speed, 1) if avg_speed is not None else None,
                 )
                 db.add(alert)
                 db.commit()
@@ -310,7 +367,7 @@ async def _rule_engine_monitor():
                     if elapsed < rule.cooldown_minutes:
                         continue
                 # Get records in the duration window
-                since = now - __import__("datetime").timedelta(minutes=rule.duration_minutes)
+                since = now - timedelta(minutes=rule.duration_minutes)
                 records = (
                     db.query(TrafficRecord)
                     .filter(
@@ -334,7 +391,7 @@ async def _rule_engine_monitor():
                 db.add(RuleEvaluation(rule_id=rule.id, metric_value=str(actual_val), location=rule.location))
                 rule.last_triggered_at = now
                 db.commit()
-                if rule.action_type in ("notify", "both"):
+                if rule.action_type in ("notify", "send_notification", "notification", "both"):
                     notification = await create_notification(
                         user_id=rule.user_id,
                         route_id=None,
@@ -393,8 +450,15 @@ async def _driver_daily_scorer():
 
 async def _weather_collector():
     """Fetch weather for all monitored cities every 30 minutes."""
-    from app.services.weather_service import refresh_all_cities
-    await refresh_all_cities()   # immediate first run on startup
+    from app.services.weather_service import ensure_weather_cache, refresh_all_cities
+
+    # Instant sync seed so /weather/* never waits on boot timing
+    ensure_weather_cache()
+    await asyncio.sleep(2)
+    try:
+        await refresh_all_cities()
+    except Exception as exc:
+        logger.error("Weather collector initial error: %s", exc)
     while True:
         await asyncio.sleep(1800)  # 30 minutes
         try:
@@ -404,32 +468,39 @@ async def _weather_collector():
 
 
 async def _ml_model_trainer():
-    """Train the ML traffic model on startup, then retrain every 6 hours."""
+    """Train the ML traffic model on startup, then retrain every 6 hours.
+
+    Training runs in a worker thread so the asyncio event loop stays responsive.
+    """
     from app.services.ml_prediction_service import ml_model
-    db = SessionLocal()
+
+    def _train_once() -> bool:
+        db = SessionLocal()
+        try:
+            return ml_model.train(db)
+        finally:
+            db.close()
+
+    # Defer heavy train so early API calls stay fast
+    await asyncio.sleep(45)
     try:
-        trained = ml_model.train(db)
+        trained = await asyncio.to_thread(_train_once)
         if trained:
             logger.info("ML model initial training complete")
         else:
             logger.warning("ML model: not enough data for initial training — rule-based fallback active")
     except Exception as exc:
         logger.error("ML model initial training error: %s", exc)
-    finally:
-        db.close()
 
     while True:
         await asyncio.sleep(6 * 3600)   # retrain every 6 hours
         if not ml_model.needs_retrain():
             continue
-        db = SessionLocal()
         try:
-            ml_model.train(db)
+            await asyncio.to_thread(_train_once)
             logger.info("ML model retrained")
         except Exception as exc:
             logger.error("ML model retrain error: %s", exc)
-        finally:
-            db.close()
 
 
 async def _incident_expiry_monitor():
@@ -461,12 +532,41 @@ async def _incident_expiry_monitor():
             db.close()
 
 
+async def _crowd_updater(pool):
+    """Recalculate and broadcast crowd scores. Slows down when live APIs are offline."""
+    from app.services.traffic_flow_service import is_live_available
+
+    while True:
+        if pool:
+            try:
+                all_data = await _update_crowd(pool)
+                ts = datetime.now(timezone.utc).isoformat() + "Z"
+                await _crowd_ws_manager.broadcast_all({"type": "crowd_update", "stations": all_data, "timestamp": ts})
+                for data in all_data:
+                    await _crowd_ws_manager.broadcast_station(
+                        data["station_id"],
+                        {"type": "crowd_update", "station": data, "timestamp": ts},
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("Crowd updater error: %s", exc)
+        # Live APIs: refresh every 60s. Offline: every 3 min (baseline only).
+        interval = 60 if is_live_available() else 180
+        await asyncio.sleep(interval)
+
+
 async def _story_refresher():
-    """Regenerate AI traffic story cards every 5 minutes and broadcast to WS clients."""
+    """Regenerate traffic story cards periodically (rule-based if AI unavailable)."""
     from app.routes.stories import broadcast_stories
     from app.services.story_generator import refresh_stories
+    from app.services.ai_service import is_ai_available
+
+    if not is_ai_available():
+        logger.info("Story refresher: no Anthropic key — using rule-based stories only")
+
+    await asyncio.sleep(90)
     while True:
-        await asyncio.sleep(300)
         db = SessionLocal()
         try:
             stories = await refresh_stories(db)
@@ -476,6 +576,7 @@ async def _story_refresher():
             logger.error("Story refresher error: %s", exc)
         finally:
             db.close()
+        await asyncio.sleep(600 if not is_ai_available() else 300)
 
 
 async def _alert_tuner():
@@ -538,63 +639,105 @@ async def _report_scheduler():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    test_connection()
-    run_column_migrations()
+    """Fast boot: accept HTTP immediately; heavy work runs in threads / after yield."""
+    app.state.crowd_pool = None
+    app.state._bg_tasks = []
 
-    # Seed incidents for all cities on first boot (idempotent)
-    from app.services.incident_seeder import auto_seed_incidents, seed_week_incidents, patch_seeded_incidents, _INCIDENT_SEEDS
-    _seed_db = SessionLocal()
     try:
-        from app.models.predictor import Incident as _Inc
-        if not _seed_db.query(_Inc).filter(_Inc.is_active == True).first():
-            for _city in _INCIDENT_SEEDS:
-                auto_seed_incidents(_city, _seed_db)
-                seed_week_incidents(_city, _seed_db)
-            logger.info("Incidents seeded for %d cities", len(_INCIDENT_SEEDS))
-        patched = patch_seeded_incidents(_seed_db)
-        if patched:
-            logger.info("Patched %d existing seeded incidents (reported_by/upvotes/expires_at)", patched)
-    except Exception as _exc:
-        logger.warning("Incident seed skipped: %s", _exc)
-    finally:
-        _seed_db.close()
+        await asyncio.wait_for(asyncio.to_thread(test_connection), timeout=3.0)
+        # Clear abandoned idle-in-transaction sessions that lock traffic_records
+        await asyncio.to_thread(cleanup_stale_db_backends, 20)
+    except Exception as exc:
+        logger.warning("DB connectivity check failed: %s", type(exc).__name__)
+
+    # Schema + light seed in a worker so import/reload never blocks the event loop
+    try:
+        await asyncio.wait_for(asyncio.to_thread(_ensure_schema), timeout=8.0)
+    except Exception as exc:
+        logger.warning("Schema ensure skipped: %s", type(exc).__name__)
+
+    try:
+        from app.core.redis import init_redis
+        await asyncio.wait_for(init_redis(), timeout=0.5)
+    except Exception as exc:
+        logger.warning("Redis init skipped: %s", type(exc).__name__)
 
     from app.routes.india_ws import _district_broadcast
     set_broadcast_fn(_district_broadcast)
-    congestion_task  = asyncio.create_task(_congestion_monitor())
-    departure_task   = asyncio.create_task(_departure_alert_monitor())
-    india_task       = asyncio.create_task(run_india_traffic_collector())
-    district_task    = asyncio.create_task(run_district_collector())
-    car_task         = asyncio.create_task(_car_tick_broadcaster())
-    trip_task        = asyncio.create_task(_live_trip_updater())
-    pulse_task       = asyncio.create_task(_traffic_pulse_monitor())
-    zone_task        = asyncio.create_task(_zone_alert_monitor())
-    rule_task        = asyncio.create_task(_rule_engine_monitor())
-    webhook_task     = asyncio.create_task(_webhook_dispatcher())
-    report_task      = asyncio.create_task(_report_scheduler())
-    story_task       = asyncio.create_task(_story_refresher())
-    tuner_task       = asyncio.create_task(_alert_tuner())
-    ml_trainer_task  = asyncio.create_task(_ml_model_trainer())
-    incident_task    = asyncio.create_task(_incident_expiry_monitor())
-    weather_task     = asyncio.create_task(_weather_collector())
-    behavior_task    = asyncio.create_task(_driver_daily_scorer())
-    logger.info(
-        "Background monitors started: congestion, departure, India, district, cars, trips, "
-        "pulse, zones, rules, webhooks, reports, stories, alert-tuner, ML-trainer, incident-expiry"
-    )
+
+    async def _deferred_boot() -> None:
+        # Migrations first (in a thread). Monitors must not start while ALTER holds locks,
+        # or sync DB calls on the event loop freeze every HTTP request.
+        try:
+            await asyncio.wait_for(asyncio.to_thread(run_startup_migrations), timeout=25.0)
+            logger.info("Startup migrations finished")
+        except Exception as exc:
+            logger.warning("Startup migrations skipped: %s", type(exc).__name__)
+
+        await asyncio.sleep(2)
+        try:
+            app.state.crowd_pool = await asyncio.wait_for(create_crowd_pool(), timeout=3.0)
+            logger.info("Crowd prediction pool ready")
+        except Exception as exc:
+            logger.warning("Crowd pool unavailable: %s", type(exc).__name__)
+            app.state.crowd_pool = None
+
+        light = [
+            asyncio.create_task(_crowd_updater(getattr(app.state, "crowd_pool", None))),
+            asyncio.create_task(_congestion_monitor()),
+            asyncio.create_task(_departure_alert_monitor()),
+            asyncio.create_task(_car_tick_broadcaster()),
+            asyncio.create_task(_live_trip_updater()),
+            asyncio.create_task(_traffic_pulse_monitor()),
+            asyncio.create_task(_incident_expiry_monitor()),
+            asyncio.create_task(_weather_collector()),  # seed early — endpoints also self-seed
+        ]
+        app.state._bg_tasks = light
+        logger.info("Light background monitors started (%d tasks)", len(light))
+
+        await asyncio.sleep(30)
+        heavy = [
+            asyncio.create_task(run_india_traffic_collector()),
+            asyncio.create_task(run_district_collector()),
+            asyncio.create_task(_zone_alert_monitor()),
+            asyncio.create_task(_rule_engine_monitor()),
+            asyncio.create_task(_webhook_dispatcher()),
+            asyncio.create_task(_report_scheduler()),
+            asyncio.create_task(_story_refresher()),
+            asyncio.create_task(_alert_tuner()),
+            asyncio.create_task(_ml_model_trainer()),
+            asyncio.create_task(_driver_daily_scorer()),
+        ]
+        app.state._bg_tasks.extend(heavy)
+        logger.info("Heavy background collectors started (%d tasks)", len(heavy))
+
+    boot_task = asyncio.create_task(_deferred_boot())
+    logger.info("API ready — deferred boot running in background")
     yield
-    all_tasks = (
-        congestion_task, departure_task, india_task, district_task,
-        car_task, trip_task, pulse_task, zone_task, rule_task, webhook_task, report_task,
-        story_task, tuner_task, ml_trainer_task, incident_task, weather_task, behavior_task,
-    )
-    for t in all_tasks:
+
+    boot_task.cancel()
+    try:
+        await boot_task
+    except asyncio.CancelledError:
+        pass
+    for t in getattr(app.state, "_bg_tasks", []):
         t.cancel()
-    for t in all_tasks:
+    for t in getattr(app.state, "_bg_tasks", []):
         try:
             await t
         except asyncio.CancelledError:
             pass
+    crowd_pool = getattr(app.state, "crowd_pool", None)
+    if crowd_pool:
+        try:
+            await crowd_pool.close()
+        except Exception:
+            pass
+    try:
+        from app.utils.http_client import close_http_client
+        await close_http_client()
+    except Exception:
+        pass
     logger.info("Background monitors stopped")
 
 
@@ -746,6 +889,45 @@ _TAGS_METADATA = [
         ),
     },
     {
+        "name": "Crowd — Stations",
+        "description": (
+            "Bus and railway stations across major Indian cities with crowd data "
+            "(live TomTom/HERE when available, otherwise IST time-of-day baseline).\n\n"
+            "**Core UUIDs:** KSR `341fed3e-…`, Majestic `feebf092-…`, Shivajinagar `5c36b0c7-…`, "
+            "Hyd Deccan `2683f4a8-…`, MGBS `b6596665-…`, Secunderabad `86c7d3f0-…`\n\n"
+            "**Aliases:** `blr-rail-01`, `blr-bus-01`, `blr-bus-02`, `hyd-rail-01`, `hyd-bus-01`, `hyd-rail-02`"
+        ),
+    },
+    {
+        "name": "Crowd — Live Prediction",
+        "description": (
+            "Real-time crowd estimates for bus and railway stations, derived from "
+            "live HERE/TomTom road traffic near each station (updated every 30 s), "
+            "with deterministic baseline fallback when APIs are offline.\n\n"
+            "- `GET /api/v1/crowd/all/now` — live crowd for all stations\n"
+            "- `GET /api/v1/crowd/{id}/now` — live crowd for one station\n"
+            "- `GET /api/v1/crowd/{id}/hourly` — 24-hour forecast from historical logs\n"
+            "- `GET /api/v1/crowd/{id}/weekly` — Mon–Sun pattern\n"
+            "- `GET /api/v1/crowd/{id}/best-time` — optimal 3-hour visit window\n\n"
+            "**Crowd levels:** 0–25 Low · 26–50 Moderate · 51–75 High · 76–100 Overcrowded\n\n"
+            "**Live WebSocket:** `ws://localhost:8000/ws/crowd` (all) · `ws://localhost:8000/ws/crowd/{id}` (one station)"
+        ),
+    },
+    {
+        "name": "Crowd — Logs",
+        "description": "Last 50 crowd log entries per station, newest first.",
+    },
+    {
+        "name": "Crowd — WebSocket",
+        "description": (
+            "WebSocket endpoints that push crowd updates every 30 seconds.\n\n"
+            "- `ws://localhost:8000/ws/crowd` — live stream for all stations\n"
+            "- `ws://localhost:8000/ws/crowd/{station_id}` — live stream for one station\n\n"
+            "On connect, the current cached snapshot is sent immediately. "
+            "Station IDs may be UUIDs or aliases (`blr-rail-01`, etc.)."
+        ),
+    },
+    {
         "name": "Admin",
         "description": "System monitoring, user management, and DB maintenance. **Requires admin account.**",
     },
@@ -826,17 +1008,83 @@ app = FastAPI(
 setup_rate_limiter(app)
 
 
+from app.utils.api_response import ApiResponseEnvelopeMiddleware, api_error  # noqa: E402
+
+
+@app.exception_handler(SQLAlchemyTimeoutError)
+@app.exception_handler(OperationalError)
+async def _database_timeout_handler(request: Request, exc: Exception):
+    """Return quickly when the database is saturated or cancels a slow query."""
+    logger.warning("Database deadline on %s %s: %s", request.method, request.url.path, type(exc).__name__)
+    return JSONResponse(
+        status_code=503,
+        content=api_error(
+            "Database is busy; retry shortly.",
+            code="DATABASE_TIMEOUT",
+        ),
+        headers={"Retry-After": "1"},
+    )
+
+
+@app.middleware("http")
+async def request_deadline(request: Request, call_next):
+    """Guarantee an HTTP response instead of leaving clients queued for minutes."""
+    try:
+        configured_timeout = float(os.getenv("API_REQUEST_TIMEOUT_SECONDS", "3.5"))
+    except (TypeError, ValueError):
+        configured_timeout = 3.5
+    # Environment configuration may tighten the deadline, never weaken the
+    # public under-four-second response guarantee.
+    timeout_seconds = min(3.5, max(0.5, configured_timeout))
+    started = asyncio.get_running_loop().time()
+    try:
+        response = await asyncio.wait_for(call_next(request), timeout=timeout_seconds)
+        elapsed = asyncio.get_running_loop().time() - started
+        response.headers["X-Process-Time"] = f"{elapsed:.3f}"
+        response.headers["Server-Timing"] = f"app;dur={elapsed * 1000:.1f}"
+        if elapsed >= 1.0:
+            logger.warning(
+                "Slow request %.3fs: %s %s",
+                elapsed,
+                request.method,
+                request.url.path,
+            )
+        return response
+    except asyncio.TimeoutError:
+        logger.error(
+            "Request deadline exceeded after %.1fs: %s %s",
+            timeout_seconds,
+            request.method,
+            request.url.path,
+        )
+        return JSONResponse(
+            status_code=504,
+            content=api_error(
+                "The request exceeded the server processing deadline.",
+                code="REQUEST_TIMEOUT",
+                details={"timeout_seconds": timeout_seconds},
+            ),
+            headers={"X-Process-Time": f"{timeout_seconds:.3f}"},
+        )
+
+
 @app.exception_handler(Exception)
 async def _dev_exception_handler(request: Request, exc: Exception):
-    """Return full traceback in development so errors are visible in the response."""
+    """Return enveloped error with traceback in development."""
     tb = traceback.format_exc()
     logger.error("Unhandled exception on %s %s:\n%s", request.method, request.url.path, tb)
     return JSONResponse(
         status_code=500,
-        content={"detail": str(exc), "type": type(exc).__name__, "traceback": tb},
+        content=api_error(
+            str(exc),
+            code=type(exc).__name__,
+            details={"traceback": tb},
+        ),
     )
 
 
+# Envelope first (inner), CORS last (outer) so CORS headers apply to wrapped JSON.
+app.add_middleware(ApiResponseEnvelopeMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -844,6 +1092,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=5)
 
 # ─── Routers ───────────────────────────────────────────────────────────────────
 app.include_router(incidents_router,    prefix="/api/v1")
@@ -879,6 +1128,11 @@ app.include_router(zones_router,        prefix="/api/v1")
 app.include_router(webhooks_router,     prefix="/api/v1")
 app.include_router(rules_router,        prefix="/api/v1")
 app.include_router(reports_router,      prefix="/api/v1")
+# ── Crowd Prediction ────────────────────────────────────────────────────────────
+app.include_router(crowd_stations_router)
+app.include_router(crowd_router)
+app.include_router(crowd_logs_router)
+app.include_router(crowd_ws_router)
 
 
 # ─── Health ────────────────────────────────────────────────────────────────────

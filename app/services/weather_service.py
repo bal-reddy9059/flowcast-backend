@@ -10,6 +10,7 @@ Environment variable:
                            simulation when absent.
 """
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -17,7 +18,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-import httpx
+from app.utils.http_client import get_http_client
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,33 @@ _CITY_COORDS: dict[str, tuple[float, float]] = {
 # In-memory cache: city → snapshot dict
 _weather_cache: dict[str, dict] = {}
 _last_fetch: Optional[datetime] = None
+
+# Area / neighbourhood → monitored city (for /weather/impact)
+_AREA_TO_CITY: dict[str, str] = {
+    # Hyderabad
+    "gachibowli": "Hyderabad", "hitech city": "Hyderabad", "madhapur": "Hyderabad",
+    "banjara hills": "Hyderabad", "jubilee hills": "Hyderabad", "kondapur": "Hyderabad",
+    "kukatpally": "Hyderabad", "lb nagar": "Hyderabad", "secunderabad": "Hyderabad",
+    "ameerpet": "Hyderabad", "kphb": "Hyderabad", "mehdipatnam": "Hyderabad",
+    "begumpet": "Hyderabad", "dilsukhnagar": "Hyderabad", "miyapur": "Hyderabad",
+    "cyber towers": "Hyderabad", "hitec city": "Hyderabad",
+    # Bangalore
+    "koramangala": "Bangalore", "indiranagar": "Bangalore", "whitefield": "Bangalore",
+    "electronic city": "Bangalore", "silk board": "Bangalore", "hebbal": "Bangalore",
+    "mg road": "Bangalore", "bengaluru": "Bangalore",
+    # Mumbai
+    "dadar": "Mumbai", "worli": "Mumbai", "powai": "Mumbai", "thane": "Mumbai",
+    "bandra": "Mumbai", "andheri": "Mumbai", "marine drive": "Mumbai", "bkc": "Mumbai",
+    # Delhi NCR
+    "connaught place": "Delhi", "lajpat nagar": "Delhi", "rohini": "Delhi",
+    "dwarka": "Delhi", "noida": "Delhi", "gurgaon": "Delhi", "gurugram": "Delhi",
+    "faridabad": "Delhi", "cyber city": "Delhi",
+    # Chennai
+    "anna nagar": "Chennai", "anna salai": "Chennai", "t nagar": "Chennai",
+    "tambaram": "Chennai", "guindy": "Chennai", "omr": "Chennai",
+    # Kolkata
+    "howrah": "Kolkata", "park street": "Kolkata", "salt lake": "Kolkata", "dum dum": "Kolkata",
+}
 
 
 # ── UUID helpers ───────────────────────────────────────────────────────────────
@@ -115,10 +143,9 @@ async def fetch_city_weather(city_meta: dict) -> Optional[dict]:
     params = {"lat": city_meta["lat"], "lon": city_meta["lng"],
               "appid": _OWM_KEY, "units": "metric"}
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            resp = await client.get(_OWM_BASE, params=params)
-            resp.raise_for_status()
-            data = resp.json()
+        resp = await get_http_client().get(_OWM_BASE, params=params)
+        resp.raise_for_status()
+        data = resp.json()
 
         rain_mm  = data.get("rain", {}).get("1h", 0.0)
         wind_kmh = round(data.get("wind", {}).get("speed", 0.0) * 3.6, 1)
@@ -220,37 +247,50 @@ def _build_snapshot(*, city: str, country: str, condition: str, description: str
 
 # ── Background refresh ─────────────────────────────────────────────────────────
 
-async def refresh_all_cities() -> list[dict]:
+def _persist_snapshots(results: list[dict]) -> None:
+    """Persist a refresh batch without blocking the asyncio event loop."""
     from app.database import SessionLocal
     from app.models.weather import WeatherSnapshot
 
+    db = SessionLocal()
+    try:
+        db.add_all([
+            WeatherSnapshot(
+                city=s["city"],
+                condition=s["condition"],
+                temp_c=s["temp_c"],
+                humidity=s["humidity"],
+                wind_kmh=s["wind_kmh"],
+                rain_mm_1h=s["rain_mm_1h"],
+                visibility_km=s["visibility_km"],
+                congestion_modifier=s["congestion_modifier"],
+            )
+            for s in results
+        ])
+        db.commit()
+    except Exception as exc:
+        logger.error("Weather DB persist error: %s", exc)
+        db.rollback()
+    finally:
+        db.close()
+
+
+async def refresh_all_cities() -> list[dict]:
+    fetched = await asyncio.gather(
+        *(fetch_city_weather(city_meta) for city_meta in _MONITORED_CITIES),
+        return_exceptions=True,
+    )
     results = []
-    for city_meta in _MONITORED_CITIES:
-        snapshot = await fetch_city_weather(city_meta)
-        if snapshot:
-            _weather_cache[snapshot["city"]] = snapshot
-            results.append(snapshot)
+    for city_meta, result in zip(_MONITORED_CITIES, fetched):
+        if isinstance(result, Exception):
+            logger.warning("Weather refresh failed for %s: %s", city_meta["city"], result)
+            continue
+        if result:
+            results.append(result)
 
     if results:
-        db = SessionLocal()
-        try:
-            for s in results:
-                db.add(WeatherSnapshot(
-                    city=s["city"],
-                    condition=s["condition"],
-                    temp_c=s["temp_c"],
-                    humidity=s["humidity"],
-                    wind_kmh=s["wind_kmh"],
-                    rain_mm_1h=s["rain_mm_1h"],
-                    visibility_km=s["visibility_km"],
-                    congestion_modifier=s["congestion_modifier"],
-                ))
-            db.commit()
-        except Exception as exc:
-            logger.error("Weather DB persist error: %s", exc)
-            db.rollback()
-        finally:
-            db.close()
+        _weather_cache.update({snapshot["city"]: snapshot for snapshot in results})
+        await asyncio.to_thread(_persist_snapshots, results)
 
     global _last_fetch
     _last_fetch = datetime.now(timezone.utc)
@@ -260,13 +300,56 @@ async def refresh_all_cities() -> list[dict]:
 
 # ── Public accessors ──────────────────────────────────────────────────────────
 
+def ensure_weather_cache() -> list[dict]:
+    """Guarantee the in-memory cache is populated (sync simulation seed).
+
+    The background collector may start ~45s after boot and clears on reload.
+    Endpoints must never return empty/404 for a known city while waiting.
+    """
+    global _last_fetch
+    if _weather_cache:
+        return list(_weather_cache.values())
+
+    for city_meta in _MONITORED_CITIES:
+        snap = _simulated_weather(city_meta)
+        _weather_cache[snap["city"]] = snap
+    _last_fetch = datetime.now(timezone.utc)
+    logger.info("Weather cache seeded with %d simulated snapshots", len(_weather_cache))
+    return list(_weather_cache.values())
+
+
+def resolve_location_city(location: str) -> Optional[str]:
+    """Map a free-text traffic location to a monitored city name."""
+    loc = location.lower().strip()
+    if not loc:
+        return None
+
+    # Direct city name match
+    for c in _MONITORED_CITIES:
+        name = c["city"].lower()
+        if name in loc or loc in name:
+            return c["city"]
+    if "bengaluru" in loc:
+        return "Bangalore"
+
+    # Longest area alias match
+    best_city = None
+    best_len = 0
+    for alias, city in _AREA_TO_CITY.items():
+        if alias in loc and len(alias) > best_len:
+            best_len = len(alias)
+            best_city = city
+    return best_city
+
+
 def get_city_id_map() -> dict[str, str]:
     """Return {city_id: city_name} for all monitored cities."""
     return {city_uuid(c["city"]): c["city"] for c in _MONITORED_CITIES}
 
 
 def get_cached_weather(city: str) -> Optional[dict]:
-    """Lookup by city name (case-insensitive)."""
+    """Lookup by city name (case-insensitive). Seeds cache if empty."""
+    ensure_weather_cache()
     for k, v in _weather_cache.items():
         if k.lower() == city.lower():
             return v
@@ -274,12 +357,11 @@ def get_cached_weather(city: str) -> Optional[dict]:
 
 
 def get_cached_weather_by_id(city_id: str) -> Optional[dict]:
-    """Lookup by stable city_id UUID. Falls back to name lookup if not matched."""
-    # Try direct match in cached snapshots
+    """Lookup by stable city_id UUID. Seeds cache if empty."""
+    ensure_weather_cache()
     for snap in _weather_cache.values():
         if snap.get("city_id") == city_id:
             return snap
-    # Fallback: resolve city_id → name from the monitored list
     id_map = get_city_id_map()
     city_name = id_map.get(city_id)
     if city_name:
@@ -288,34 +370,56 @@ def get_cached_weather_by_id(city_id: str) -> Optional[dict]:
 
 
 def get_all_cached() -> list[dict]:
-    return list(_weather_cache.values())
+    return ensure_weather_cache()
 
 
 def get_monitored_cities() -> list[str]:
     return [c["city"] for c in _MONITORED_CITIES]
 
 
-def weather_impact_for_location(location: str) -> dict:
-    loc = location.lower()
-    for city_name, snap in _weather_cache.items():
-        if city_name.lower() in loc or loc in city_name.lower():
-            return {
-                "city_id":            snap.get("city_id"),
-                "city":               city_name,
-                "condition":          snap["condition"],
-                "congestion_modifier": snap["congestion_modifier"],
-                "alert_level":        snap.get("alert_level", "normal"),
-                "rain_mm_1h":         snap.get("rain_mm_1h", 0),
-                "visibility_km":      snap.get("visibility_km", 10),
-                "impact_advice":      snap.get("impact_advice", ""),
-            }
+def get_cache_meta() -> dict:
+    ensure_weather_cache()
     return {
-        "city_id":             None,
-        "city":                None,
-        "condition":           "Unknown",
-        "congestion_modifier": "none",
-        "alert_level":         "normal",
-        "rain_mm_1h":          0,
-        "visibility_km":       10,
-        "impact_advice":       "No weather data available for this location.",
+        "cities_cached": len(_weather_cache),
+        "last_fetch_at": _last_fetch.isoformat() if _last_fetch else None,
+        "owm_configured": bool(_OWM_KEY),
+        "data_source": "openweathermap" if _OWM_KEY else "simulated",
+    }
+
+
+def weather_impact_for_location(location: str) -> dict:
+    ensure_weather_cache()
+    city_name = resolve_location_city(location)
+
+    snap = get_cached_weather(city_name) if city_name else None
+    if snap is None:
+        # Last resort: scan cache for substring (already tried resolve)
+        loc = location.lower()
+        for name, cached in _weather_cache.items():
+            if name.lower() in loc or loc in name.lower():
+                snap = cached
+                city_name = name
+                break
+
+    if snap is None:
+        return {
+            "city_id":             None,
+            "city":                None,
+            "condition":           "Unknown",
+            "congestion_modifier": "none",
+            "alert_level":         "normal",
+            "rain_mm_1h":          0,
+            "visibility_km":       10,
+            "impact_advice":       "No weather data available for this location.",
+        }
+
+    return {
+        "city_id":             snap.get("city_id"),
+        "city":                city_name or snap.get("city"),
+        "condition":           snap["condition"],
+        "congestion_modifier": snap["congestion_modifier"],
+        "alert_level":         snap.get("alert_level", "normal"),
+        "rain_mm_1h":          snap.get("rain_mm_1h", 0),
+        "visibility_km":       snap.get("visibility_km", 10),
+        "impact_advice":       snap.get("impact_advice", ""),
     }

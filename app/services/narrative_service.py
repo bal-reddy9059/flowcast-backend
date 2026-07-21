@@ -40,6 +40,14 @@ def build_route_narrative(
     expected_eta = (distance_km / max(free_flow_speed, 1)) * 60
     delay_min = max(0.0, eta_minutes - expected_eta)
 
+    # Align congestion label with actual delay so narrative/UI stay consistent
+    if delay_min >= 30 or (expected_eta > 0 and delay_min / expected_eta >= 1.5):
+        congestion_level = "high"
+    elif delay_min >= 12 or (expected_eta > 0 and delay_min / expected_eta >= 0.5):
+        if congestion_level == "low":
+            congestion_level = "medium"
+    # else keep provided level
+
     context_lines = [
         f"Route: {origin} → {destination}",
         f"Distance: {distance_km} km",

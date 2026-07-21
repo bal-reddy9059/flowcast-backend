@@ -6,10 +6,11 @@ used by the frontend Google Maps heatmap layer.
 """
 
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 import logging
 from typing import List, Optional
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, or_
 from sqlalchemy.orm import Session
 
 from app.models.predictor import TrafficRecord
@@ -17,12 +18,20 @@ from app.schemas.heatmap import HeatmapPoint, HeatmapResponse
 
 logger = logging.getLogger(__name__)
 
+_IST = ZoneInfo("Asia/Kolkata")
 COVERAGE_AREA = "India"
 
-# Max vehicle count used to normalise the vehicle score (district collector ceiling)
-_MAX_VEHICLES = 3500.0
-# Free-flow speed used to normalise the speed score
+# Typical vehicle estimate ceiling from TomTom/HERE collectors
+_MAX_VEHICLES = 1200.0
 _FREE_FLOW_SPEED = 60.0
+
+
+def _to_ist_iso(dt: datetime | None) -> str | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(_IST).isoformat()
 
 
 def calculate_intensity(
@@ -33,19 +42,22 @@ def calculate_intensity(
     """
     Calculate a normalised intensity score between 0.0 and 1.0.
 
-    Uses continuous scaling so points with different speeds/counts produce
-    distinct intensities (avoids all high-congestion points collapsing to 0.96).
+    High congestion + slow traffic can reach 1.0 so filters like
+    min_intensity=1 still return the worst hotspots.
     """
-    # Speed: lower speed → higher intensity (linear, clamped 0-1)
-    speed_score = max(0.0, min(1.0, 1.0 - (average_speed / _FREE_FLOW_SPEED))) if average_speed > 0 else 1.0
+    level = (congestion_level or "medium").lower()
+    base = {"low": 0.25, "medium": 0.55, "high": 0.80}.get(level, 0.50)
 
-    # Vehicle count: more vehicles → higher intensity (linear, clamped 0-1)
-    vehicle_score = max(0.0, min(1.0, vehicle_count / _MAX_VEHICLES)) if vehicle_count else 0.0
+    # Lower speed → higher boost (up to +0.20)
+    if average_speed and average_speed > 0:
+        speed_boost = max(0.0, min(0.20, (1.0 - average_speed / _FREE_FLOW_SPEED) * 0.20))
+    else:
+        speed_boost = 0.20
 
-    # Congestion level: discrete weight
-    congestion_score = {"low": 0.2, "medium": 0.5, "high": 1.0}.get(congestion_level, 0.5)
+    # More vehicles → higher boost (up to +0.15)
+    vehicle_boost = max(0.0, min(0.15, (max(vehicle_count, 0) / _MAX_VEHICLES) * 0.15))
 
-    intensity = speed_score * 0.4 + vehicle_score * 0.4 + congestion_score * 0.2
+    intensity = base + speed_boost + vehicle_boost
     return round(min(max(intensity, 0.0), 1.0), 2)
 
 
@@ -56,7 +68,14 @@ def _latest_records_query(lookback_time: datetime):
             TrafficRecord.location.label("location"),
             func.max(TrafficRecord.created_at).label("latest_created_at"),
         )
-        .where(TrafficRecord.created_at > lookback_time)
+        .where(
+            or_(
+                TrafficRecord.created_at > lookback_time,
+                TrafficRecord.timestamp > lookback_time,
+            ),
+            TrafficRecord.latitude.isnot(None),
+            TrafficRecord.longitude.isnot(None),
+        )
         .group_by(TrafficRecord.location)
         .subquery()
     )
@@ -66,6 +85,10 @@ def _latest_records_query(lookback_time: datetime):
             latest_subquery,
             (TrafficRecord.location == latest_subquery.c.location)
             & (TrafficRecord.created_at == latest_subquery.c.latest_created_at),
+        )
+        .where(
+            TrafficRecord.latitude.isnot(None),
+            TrafficRecord.longitude.isnot(None),
         )
         .order_by(TrafficRecord.created_at.desc())
     )
@@ -79,7 +102,7 @@ def get_heatmap_data(
     db: Session,
 ) -> HeatmapResponse:
     """
-    Retrieve heatmap points for Hyderabad traffic within a lookback window.
+    Retrieve heatmap points within a lookback window.
 
     Filters traffic records by age, optional congestion level, and intensity threshold.
     Returns top points ordered by intensity.
@@ -88,29 +111,33 @@ def get_heatmap_data(
     query = _latest_records_query(lookback_time)
 
     if congestion_filter is not None:
-        query = query.where(TrafficRecord.congestion_level == congestion_filter)
+        query = query.where(TrafficRecord.congestion_level == congestion_filter.lower())
 
     records = db.execute(query).scalars().all()
 
     points: List[HeatmapPoint] = []
     for record in records:
+        if record.latitude is None or record.longitude is None:
+            continue
+
         intensity = calculate_intensity(
             vehicle_count=record.vehicle_count or 0,
-            average_speed=record.average_speed or 0.0,
-            congestion_level=record.congestion_level or "low",
+            average_speed=float(record.average_speed or 0.0),
+            congestion_level=record.congestion_level or "medium",
         )
         if intensity < min_intensity:
             continue
+
         points.append(
             HeatmapPoint(
-                latitude=record.latitude,
-                longitude=record.longitude,
+                latitude=float(record.latitude),
+                longitude=float(record.longitude),
                 intensity=intensity,
-                congestion_level=record.congestion_level,
+                congestion_level=record.congestion_level or "medium",
                 location=record.location,
-                vehicle_count=record.vehicle_count,
-                average_speed=record.average_speed,
-                timestamp=record.timestamp,
+                vehicle_count=int(record.vehicle_count or 0),
+                average_speed=round(float(record.average_speed or 0.0), 1),
+                timestamp=_to_ist_iso(record.timestamp or record.created_at) or _to_ist_iso(datetime.now(timezone.utc)),
             )
         )
 
@@ -118,25 +145,30 @@ def get_heatmap_data(
     points = points[:limit]
 
     total_points = len(points)
-    high_congestion_count = sum(1 for p in points if p.intensity > 0.7)
+    high_congestion_count = sum(
+        1 for p in points if p.congestion_level == "high" or p.intensity >= 0.7
+    )
     average_intensity = (
         round(sum(p.intensity for p in points) / total_points, 2)
         if total_points > 0 else 0.0
     )
 
     logger.info(
-        "Heatmap data generated: hours=%s, filter=%s, min_intensity=%s, limit=%s, points=%s",
-        hours, congestion_filter, min_intensity, limit, total_points,
+        "Heatmap data generated: hours=%s, filter=%s, min_intensity=%s, limit=%s, points=%s (scanned=%s)",
+        hours, congestion_filter, min_intensity, limit, total_points, len(records),
     )
 
     return HeatmapResponse(
+        success=True,
         points=points,
         total_points=total_points,
         high_congestion_count=high_congestion_count,
         average_intensity=average_intensity,
         coverage_area=COVERAGE_AREA,
-        generated_at=datetime.now(timezone.utc),
+        generated_at=_to_ist_iso(datetime.now(timezone.utc)),
         hours_lookback=hours,
+        congestion_filter=congestion_filter,
+        min_intensity=min_intensity,
     )
 
 
@@ -158,31 +190,30 @@ def get_india_hotspots(db: Session, limit: int = 10, severity: Optional[str] = N
     Uses the last hour of traffic records and returns the most congested locations.
     Optionally filter by severity tier: critical, high, moderate, low.
     """
-    from zoneinfo import ZoneInfo
-    _IST = ZoneInfo("Asia/Kolkata")
-
     lookback_time = datetime.now(timezone.utc) - timedelta(hours=1)
     query = _latest_records_query(lookback_time)
     records = db.execute(query).scalars().all()
 
     hotspot_list = []
     for record in records:
+        if record.latitude is None or record.longitude is None:
+            continue
         intensity = calculate_intensity(
             vehicle_count=record.vehicle_count or 0,
-            average_speed=record.average_speed or 0.0,
-            congestion_level=record.congestion_level or "low",
+            average_speed=float(record.average_speed or 0.0),
+            congestion_level=record.congestion_level or "medium",
         )
         sev = classify_severity(intensity)
         hotspot_list.append({
-            "latitude": record.latitude,
-            "longitude": record.longitude,
+            "latitude": float(record.latitude),
+            "longitude": float(record.longitude),
             "intensity": intensity,
             "severity": sev,
             "congestion_level": record.congestion_level,
             "location": record.location,
-            "vehicle_count": record.vehicle_count,
-            "average_speed": record.average_speed,
-            "timestamp": record.timestamp,
+            "vehicle_count": int(record.vehicle_count or 0),
+            "average_speed": round(float(record.average_speed or 0.0), 1),
+            "timestamp": _to_ist_iso(record.timestamp or record.created_at),
         })
 
     hotspot_list.sort(key=lambda p: p["intensity"], reverse=True)
@@ -197,10 +228,11 @@ def get_india_hotspots(db: Session, limit: int = 10, severity: Optional[str] = N
         len(records), severity, len(hotspots),
     )
     return {
-        "coverage_area":    COVERAGE_AREA,
-        "total_evaluated":  len(records),
-        "severity_filter":  severity,
-        "returned":         len(hotspots),
-        "hotspots":         hotspots,
-        "generated_at":     datetime.now(timezone.utc).astimezone(_IST).isoformat(),
+        "success": True,
+        "coverage_area": COVERAGE_AREA,
+        "total_evaluated": len(records),
+        "severity_filter": severity,
+        "returned": len(hotspots),
+        "hotspots": hotspots,
+        "generated_at": _to_ist_iso(datetime.now(timezone.utc)),
     }

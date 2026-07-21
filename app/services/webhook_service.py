@@ -12,13 +12,14 @@ import httpx
 from sqlalchemy.orm import Session
 
 from app.models.webhook import Webhook, WebhookDelivery
+from app.utils.http_client import get_http_client
 
 logger = logging.getLogger(__name__)
 
 webhook_queue: asyncio.Queue = asyncio.Queue()
 
-_MAX_RETRIES = 3
-_RETRY_DELAY = 5  # seconds
+_MAX_RETRIES = 1  # request path is bounded; retries belong in the queue worker
+_RETRY_DELAY = 0
 
 # Human-readable error messages for common HTTP status codes
 _HTTP_ERROR_HINTS: dict[int, str] = {
@@ -27,7 +28,7 @@ _HTTP_ERROR_HINTS: dict[int, str] = {
     403: "Forbidden — your endpoint denied access",
     404: "Not Found — webhook URL does not exist, update it via PUT /webhooks/{id}",
     405: "Method Not Allowed — your endpoint does not accept POST requests",
-    408: "Request Timeout — your endpoint took too long to respond (>10 s)",
+    408: "Request Timeout — your endpoint took too long to respond",
     422: "Unprocessable Entity — your endpoint could not parse the payload",
     429: "Too Many Requests — your endpoint is rate-limiting FlowCast",
     500: "Internal Server Error — your endpoint threw an unhandled exception",
@@ -76,8 +77,7 @@ async def deliver_webhook(webhook: Webhook, event_type: str, payload: dict, db: 
         attempted_at = datetime.now(timezone.utc)
 
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(webhook.url, content=body, headers=headers)
+            resp = await get_http_client().post(webhook.url, content=body, headers=headers)
 
             # Always record attempted_at — whether success or failure
             delivery.delivered_at  = attempted_at
@@ -112,7 +112,7 @@ async def deliver_webhook(webhook: Webhook, event_type: str, payload: dict, db: 
         except httpx.TimeoutException:
             delivery.delivered_at  = attempted_at
             delivery.http_status   = None
-            delivery.error_message = f"Timeout — endpoint did not respond within 10 seconds ({webhook.url})"
+            delivery.error_message = f"Timeout — endpoint did not respond within 1.2 seconds ({webhook.url})"
             webhook.failed_deliveries += 1
             db.commit()
             logger.warning("Webhook %s timeout attempt %d", webhook.id, attempt)

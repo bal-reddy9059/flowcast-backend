@@ -11,6 +11,66 @@ from sqlalchemy.orm import Session
 logger = logging.getLogger(__name__)
 
 _client = None
+_ai_disabled = False
+
+# Explicit kill-switch — default OFF; set AI_ENABLED=true + real key to enable Claude
+AI_ENABLED = os.getenv("AI_ENABLED", "false").lower() in ("1", "true", "yes")
+
+_PLACEHOLDERS = {
+    "",
+    "your_anthropic_api_key_here",
+    "your_key_here",
+    "ANTHROPIC_KEY",
+    "sk-ant-api-key-here",
+}
+
+
+def _valid_api_key() -> str | None:
+    if not AI_ENABLED:
+        return None
+    raw = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
+    if not raw:
+        return None
+    lowered = raw.lower()
+    if raw in _PLACEHOLDERS or "your_" in lowered or "placeholder" in lowered or "example" in lowered:
+        return None
+    if not raw.startswith("sk-"):
+        return None
+    return raw
+
+
+def _get_client():
+    global _client, _ai_disabled
+    if not AI_ENABLED or _ai_disabled:
+        return None
+    if _client is None:
+        try:
+            import anthropic
+            api_key = _valid_api_key()
+            if api_key:
+                _client = anthropic.Anthropic(api_key=api_key, timeout=2.2)
+            else:
+                logger.info("Anthropic AI skipped — no valid ANTHROPIC_API_KEY (using rule-based fallbacks)")
+                _ai_disabled = True
+        except ImportError:
+            logger.warning("anthropic package not installed — AI features unavailable")
+            _ai_disabled = True
+    return None if _ai_disabled else _client
+
+
+def _disable_ai(reason: str) -> None:
+    """Stop retrying Anthropic after auth / permanent failures."""
+    global _client, _ai_disabled
+    _ai_disabled = True
+    _client = None
+    logger.info("AI skipped for this process: %s", reason)
+
+
+def is_ai_available() -> bool:
+    if not AI_ENABLED or _ai_disabled:
+        return False
+    return _valid_api_key() is not None and _get_client() is not None
+
 
 SYSTEM_PROMPT = (
     "You are FlowCast AI, an expert traffic intelligence assistant for India. "
@@ -23,21 +83,6 @@ SYSTEM_PROMPT = (
     "(5) Factor in India-specific patterns: peak hours 8-10am and 5-8pm, monsoon slowdowns, festival traffic. "
     "(6) Always end with a clear action when relevant ('Leave by 5:30pm', 'Take the Expressway')."
 )
-
-
-def _get_client():
-    global _client
-    if _client is None:
-        try:
-            import anthropic
-            api_key = os.getenv("ANTHROPIC_API_KEY")
-            if api_key:
-                _client = anthropic.Anthropic(api_key=api_key)
-            else:
-                logger.warning("ANTHROPIC_API_KEY not set — AI features will use fallback mode")
-        except ImportError:
-            logger.warning("anthropic package not installed — AI features unavailable")
-    return _client
 
 
 def build_traffic_context(location: str, db: Session, user_id: Optional[str] = None) -> str:
@@ -167,7 +212,11 @@ def generate_stories(events_context: str) -> list:
                 text = text[4:]
         return json.loads(text)
     except Exception as exc:
-        logger.error("Story generation error: %s", exc)
+        msg = str(exc).lower()
+        if "401" in msg or "authentication" in msg or "invalid" in msg and "key" in msg:
+            _disable_ai(f"story generation auth failure: {exc}")
+        else:
+            logger.error("Story generation error: %s", exc)
         return []
 
 
@@ -273,8 +322,46 @@ def _fallback_chat(user_message: str, context: str) -> str:
 
 
 def _fallback_narrative(route_context: str) -> str:
-    if "high" in route_context:
-        return "Traffic on this route is currently heavy with significant delays. Plan for extra travel time and consider departure timing carefully."
-    if "medium" in route_context:
-        return "Moderate traffic conditions on this route. Minor delays possible — add 10–15 minutes to your estimate."
+    """Build a briefing from structured context when Claude is unavailable."""
+    import re
+
+    delay_m = None
+    eta_m = None
+    m_delay = re.search(r"Delay:\s*([\d.]+)\s*minutes", route_context, re.I)
+    m_eta = re.search(r"Current ETA:\s*([\d.]+)\s*minutes", route_context, re.I)
+    if m_delay:
+        delay_m = float(m_delay.group(1))
+    if m_eta:
+        eta_m = float(m_eta.group(1))
+
+    ctx_lower = route_context.lower()
+    # Prefer delay magnitude over a stale "Congestion: medium" label
+    if delay_m is not None and delay_m >= 30:
+        level = "high"
+    elif delay_m is not None and delay_m >= 12:
+        level = "medium"
+    elif "congestion: high" in ctx_lower or " high" in ctx_lower and "congestion" in ctx_lower:
+        level = "high"
+    elif "congestion: medium" in ctx_lower:
+        level = "medium"
+    else:
+        level = "low"
+
+    if level == "high":
+        tip = (
+            f"Expect about {int(delay_m)} minutes of delay"
+            if delay_m
+            else "Plan for significant extra travel time"
+        )
+        eta_bit = f" Current ETA is roughly {int(eta_m)} minutes." if eta_m else ""
+        return (
+            f"Traffic on this route is heavy with major delays. {tip}.{eta_bit} "
+            "Consider leaving earlier or waiting for a clearer window."
+        )
+    if level == "medium":
+        add = int(delay_m) if delay_m is not None else 10
+        return (
+            f"Moderate traffic on this route. Add about {add} minutes to a free-flow estimate"
+            + (f" (ETA around {int(eta_m)} minutes)." if eta_m else ".")
+        )
     return "Traffic is flowing well on this route. Good conditions for travel right now."

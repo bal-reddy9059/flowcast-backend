@@ -23,7 +23,6 @@ if not TOMTOM_API_KEY:
 
 _FLOW_URL      = "https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/10/json"
 _INCIDENT_URL  = "https://api.tomtom.com/traffic/services/5/incidentDetails"
-_TIMEOUT       = 8  # seconds per request
 
 # Set to True after a 401 so we stop wasting calls for the rest of the process lifetime
 _key_invalid = False
@@ -46,25 +45,26 @@ async def fetch_flow(lat: float, lng: float) -> Optional[dict]:
     if not _key_ok():
         return None
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-            resp = await client.get(
-                _FLOW_URL,
-                params={
-                    "point": f"{lat},{lng}",
-                    "unit": "KMPH",
-                    "key": TOMTOM_API_KEY,
-                },
+        from app.utils.http_client import get_http_client
+        client = get_http_client()
+        resp = await client.get(
+            _FLOW_URL,
+            params={
+                "point": f"{lat},{lng}",
+                "unit": "KMPH",
+                "key": TOMTOM_API_KEY,
+            },
+        )
+        if resp.status_code == 200:
+            return resp.json().get("flowSegmentData")
+        if resp.status_code == 401:
+            _key_invalid = True
+            logger.warning(
+                "TomTom API key is invalid (401). Disabling TomTom calls — "
+                "using simulation fallback. Add a valid key to .env to enable real data."
             )
-            if resp.status_code == 200:
-                return resp.json().get("flowSegmentData")
-            if resp.status_code == 401:
-                _key_invalid = True
-                logger.warning(
-                    "TomTom API key is invalid (401). Disabling TomTom calls — "
-                    "using simulation fallback. Add a valid key to .env to enable real data."
-                )
-            else:
-                logger.debug("TomTom flow %s,%s → HTTP %s", lat, lng, resp.status_code)
+        else:
+            logger.debug("TomTom flow %s,%s → HTTP %s", lat, lng, resp.status_code)
     except httpx.TimeoutException:
         logger.debug("TomTom flow timeout for %s,%s", lat, lng)
     except Exception as exc:
@@ -84,29 +84,30 @@ async def fetch_incidents(min_lat: float, min_lng: float,
     if not _key_ok():
         return []
     try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-            resp = await client.get(
-                _INCIDENT_URL,
-                params={
-                    "bbox": f"{min_lng},{min_lat},{max_lng},{max_lat}",
-                    "key": TOMTOM_API_KEY,
-                    "language": "en-GB",
-                    "categoryFilter": "0,1,2,3,4,5,6,7,8,9,10,11",
-                    "timeValidityFilter": "present",
-                    "fields": (
-                        "{incidents{type,geometry{coordinates},"
-                        "properties{iconCategory,magnitudeOfDelay,"
-                        "events{description},from,to,roadNumbers}}}"
-                    ),
-                },
-            )
-            if resp.status_code == 200:
-                return resp.json().get("incidents", [])
-            if resp.status_code == 401:
-                _key_invalid = True
-                logger.warning("TomTom incidents: API key invalid (401), disabling TomTom calls")
-            else:
-                logger.debug("TomTom incidents HTTP %s", resp.status_code)
+        from app.utils.http_client import get_http_client
+        client = get_http_client()
+        resp = await client.get(
+            _INCIDENT_URL,
+            params={
+                "bbox": f"{min_lng},{min_lat},{max_lng},{max_lat}",
+                "key": TOMTOM_API_KEY,
+                "language": "en-GB",
+                "categoryFilter": "0,1,2,3,4,5,6,7,8,9,10,11",
+                "timeValidityFilter": "present",
+                "fields": (
+                    "{incidents{type,geometry{coordinates},"
+                    "properties{iconCategory,magnitudeOfDelay,"
+                    "events{description},from,to,roadNumbers}}}"
+                ),
+            },
+        )
+        if resp.status_code == 200:
+            return resp.json().get("incidents", [])
+        if resp.status_code == 401:
+            _key_invalid = True
+            logger.warning("TomTom incidents: API key invalid (401), disabling TomTom calls")
+        else:
+            logger.debug("TomTom incidents HTTP %s", resp.status_code)
     except Exception as exc:
         logger.error("TomTom incidents error: %s", exc)
     return []

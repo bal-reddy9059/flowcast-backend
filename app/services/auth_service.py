@@ -46,6 +46,23 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None) -> s
     return jwt.encode(token_data, SECRET_KEY, algorithm=ALGORITHM)
 
 
+def user_token_claims(user: User) -> dict:
+    """JWT claims used by the frontend for header/profile fallback when /me is slow."""
+    display = (user.full_name or "").strip() or (user.email or "").split("@")[0] or "User"
+    return {
+        "sub": user.email,
+        "user_id": str(user.id),
+        "email": user.email,
+        "full_name": display,
+        "name": display,
+    }
+
+
+def issue_access_token(user: User, expires_delta: timedelta | None = None) -> str:
+    """Create a JWT that includes display claims for the UI."""
+    return create_access_token(user_token_claims(user), expires_delta=expires_delta)
+
+
 def decode_access_token(token: str) -> TokenData:
     """Decode a JWT access token and return TokenData, or raise HTTP 401 on failure."""
     if SECRET_KEY is None:

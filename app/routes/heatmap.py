@@ -41,13 +41,12 @@ async def get_heatmap(
     congestion_filter: Optional[str] = Query(
         None,
         description="Optional congestion level filter: low, medium, high",
-        openapi_examples={"default": {"value": "high"}},
     ),
     min_intensity: float = Query(
         0.0,
         ge=0.0,
         le=1.0,
-        description="Minimum intensity threshold for returned points",
+        description="Minimum intensity (0.0–1.0). Use 0.0 for all points; high congestion typically scores ≥0.8",
     ),
     limit: int = Query(
         500,
@@ -60,16 +59,18 @@ async def get_heatmap(
     """
     Get traffic heatmap data for Google Maps HeatmapLayer visualization.
 
-    Returns a list of heatmap points covering Hyderabad traffic locations.
-    Results are cached in Redis for 120 seconds.
+    Returns a list of heatmap points with lat/lng, intensity (0–1), speed, and vehicle count.
+    Results are cached for 120 seconds.
     """
-    if congestion_filter is not None and congestion_filter not in ALLOWED_CONGESTION_FILTERS:
+    if congestion_filter is not None and congestion_filter.lower() not in ALLOWED_CONGESTION_FILTERS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="congestion_filter must be low, medium, or high",
         )
 
-    cache_key = f"heatmap:{hours}:{congestion_filter}:{min_intensity}:{limit}"
+    congestion_filter = congestion_filter.lower() if congestion_filter else None
+
+    cache_key = f"heatmap:v2:{hours}:{congestion_filter}:{min_intensity}:{limit}"
     cached = await get_cache(cache_key)
     if cached:
         logger.debug("Heatmap cache HIT for key=%s", cache_key)

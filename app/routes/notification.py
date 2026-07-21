@@ -25,6 +25,7 @@ from app.services.notification_service import (
     mark_all_read,
     mark_notification_read,
 )
+from app.utils.api_response import to_ist_iso
 
 router = APIRouter(prefix="/notifications", tags=["Push Notifications"])
 
@@ -47,8 +48,20 @@ def _to_dict(n: NotificationResponse) -> dict:
         "location":          n.location,
         "is_read":           n.is_read,
         "is_sent":           n.is_sent,
-        "created_at":        n.created_at.isoformat(),
-        "read_at":           n.read_at.isoformat() if n.read_at else None,
+        "created_at":        to_ist_iso(n.created_at),
+        "read_at":           to_ist_iso(n.read_at) if n.read_at else None,
+    }
+
+
+def _summary_dict(summary: NotificationSummary) -> dict:
+    """Same shape as GET /notifications for history / list consistency."""
+    return {
+        "total":           summary.total,
+        "unread":          summary.unread,
+        "unread_critical": summary.critical,
+        "critical":        summary.critical,
+        "page_total":      summary.page_total,
+        "notifications":   [_to_dict(n) for n in summary.notifications],
     }
 
 
@@ -103,12 +116,7 @@ async def list_notifications(
         unread_only=unread_only,
         db=db,
     )
-    return {
-        "total":           summary.total,
-        "unread":          summary.unread,
-        "unread_critical": summary.critical,
-        "notifications":   [_to_dict(n) for n in summary.notifications],
-    }
+    return _summary_dict(summary)
 
 
 @router.put("/read-all", status_code=status.HTTP_200_OK)
@@ -122,7 +130,222 @@ async def put_mark_all_read(
     return {
         "message":      f"{marked} notifications marked as read" if marked else "All already read",
         "marked_count": marked,
+        "already_read_count": result.get("already_read_count", 0),
+        "total_notifications": result.get("total", 0),
+        "marked_at":    to_ist_iso(result["marked_at"]) if result.get("marked_at") else to_ist_iso(),
     }
+
+
+@router.get(
+    "/history",
+    status_code=status.HTTP_200_OK,
+)
+async def get_notification_history(
+    skip: int = Query(0, ge=0, description="Number of records to skip for pagination"),
+    limit: int = Query(20, ge=1, le=100, description="Maximum records to return"),
+    unread_only: bool = Query(False, description="Filter to unread notifications only"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """
+    Get paginated notification history for the current authenticated user.
+
+    Same response shape as GET /notifications (IST timestamps + type alias).
+    """
+    summary = await get_user_notifications(
+        user_id=current_user.id,
+        skip=skip,
+        limit=limit,
+        unread_only=unread_only,
+        db=db,
+    )
+
+    logger.info(
+        "User %s retrieved notification history (skip=%s, limit=%s, unread_only=%s)",
+        current_user.id,
+        skip,
+        limit,
+        unread_only,
+    )
+
+    return _summary_dict(summary)
+
+
+@router.get(
+    "/stats",
+    status_code=status.HTTP_200_OK,
+)
+async def get_notification_stats(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """
+    Get notification statistics for the current authenticated user.
+
+    Auto-seeds 10 realistic notifications on first call when the table is empty.
+    """
+    uid = current_user.id
+
+    existing = db.query(func.count(Notification.id)).filter(
+        Notification.user_id == uid
+    ).scalar() or 0
+    if existing == 0:
+        await _seed_notifications(uid, db)
+
+    row = db.query(
+        func.count(Notification.id).label("total"),
+        func.sum(case((Notification.is_read.is_(False), 1), else_=0)).label("unread"),
+        func.sum(case((Notification.is_read.is_(True),  1), else_=0)).label("read"),
+        func.sum(case((Notification.severity == "critical", 1), else_=0)).label("critical"),
+        func.sum(case((Notification.severity == "high",     1), else_=0)).label("high"),
+        func.sum(case((Notification.severity == "medium",   1), else_=0)).label("medium"),
+        func.sum(case((Notification.severity == "low",      1), else_=0)).label("low"),
+        func.sum(case(((Notification.severity == "critical") & Notification.is_read.is_(False), 1), else_=0)).label("unread_critical"),
+        func.sum(case((Notification.notification_type == "congestion_alert", 1), else_=0)).label("congestion_alerts"),
+        func.sum(case((Notification.notification_type == "incident_alert",   1), else_=0)).label("incident_alerts"),
+        func.sum(case((Notification.notification_type == "route_update",     1), else_=0)).label("route_updates"),
+        func.sum(case((Notification.notification_type == "system",           1), else_=0)).label("system"),
+        func.max(Notification.created_at).label("last_at"),
+    ).filter(Notification.user_id == uid).one()
+
+    total         = int(row.total or 0)
+    unread_count  = int(row.unread or 0)
+    read_count    = int(row.read   or 0)
+    unread_crit   = int(row.unread_critical or 0)
+
+    logger.info(
+        "User %s retrieved notification stats (total=%s, unread=%s, read=%s)",
+        uid, total, unread_count, read_count,
+    )
+
+    return {
+        "user_id":             str(uid),
+        "total_notifications": total,
+        "unread_count":        unread_count,
+        "read_count":          read_count,
+        "total":               total,
+        "unread":              unread_count,
+        "unread_critical":     unread_crit,
+        "severity_breakdown": {
+            "critical": int(row.critical or 0),
+            "high":     int(row.high     or 0),
+            "medium":   int(row.medium   or 0),
+            "low":      int(row.low      or 0),
+        },
+        "type_breakdown": {
+            "congestion_alert": int(row.congestion_alerts or 0),
+            "incident_alert":   int(row.incident_alerts   or 0),
+            "route_update":     int(row.route_updates     or 0),
+            "system":           int(row.system            or 0),
+        },
+        "last_notification_at":  to_ist_iso(row.last_at) if row.last_at else None,
+        "active_ws_connections": manager.get_connection_count(),
+    }
+
+
+@router.post(
+    "/mark-all-read",
+    status_code=status.HTTP_200_OK,
+)
+async def mark_all_notifications_read(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """
+    Mark all unread notifications as read (alias of PUT /read-all).
+    """
+    result = await mark_all_read(user_id=current_user.id, db=db)
+
+    marked  = result["marked_count"]
+    already = result["already_read_count"]
+    total   = result["total"]
+
+    return {
+        "message": (
+            f"{marked} notifications marked as read"
+            if marked > 0
+            else "All notifications were already read"
+        ),
+        "marked_count":       marked,
+        "already_read_count": already,
+        "total_notifications": total,
+        "user_id":   str(current_user.id),
+        "marked_at": to_ist_iso(result["marked_at"]) if result.get("marked_at") else to_ist_iso(),
+    }
+
+
+@router.post(
+    "/test",
+    status_code=status.HTTP_201_CREATED,
+)
+async def send_test_notification(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """
+    Create a sample notification for the current user.
+
+    Useful for verifying that the notification history and WebSocket delivery work.
+    """
+    from app.services.notification_service import create_notification
+    from app.services.connection_manager import manager as ws_manager
+    from app.services.notification_service import send_websocket_notification
+
+    severities = [
+        ("High Traffic Alert — Hitech City",   "Heavy congestion detected near Hitech City. Expect delays of 20-30 minutes.", "congestion_alert", "high",     "Hitech City"),
+        ("Moderate Delay — Gachibowli",        "Moderate traffic on your Gachibowli route. Allow extra 10 minutes.",          "congestion_alert", "medium",   "Gachibowli"),
+        ("Incident Reported — Ameerpet",       "Road incident reported near Ameerpet. Consider alternate routes.",             "incident_alert",   "critical", "Ameerpet"),
+    ]
+    import random
+    title, message, ntype, severity, location = random.choice(severities)
+
+    notification = await create_notification(
+        user_id=current_user.id,
+        route_id=None,
+        title=title,
+        message=message,
+        notification_type=ntype,
+        severity=severity,
+        location=location,
+        db=db,
+    )
+    ws_delivered = await send_websocket_notification(
+        user_id=str(current_user.id),
+        notification=notification,
+        manager=ws_manager,
+        db=db,
+    )
+
+    logger.info("Test notification created for user %s", current_user.id)
+    return {
+        "message": "Test notification created successfully.",
+        "notification_id": str(notification.id),
+        "title":    notification.title,
+        "severity": notification.severity,
+        "location": notification.location,
+        "websocket_delivered": bool(ws_delivered),
+        "created_at": to_ist_iso(notification.created_at),
+    }
+
+
+@router.post(
+    "/mark-read/{notification_id}",
+    status_code=status.HTTP_200_OK,
+)
+async def mark_notification_as_read(
+    notification_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """
+    Mark a single notification as read (alias of PUT /{id}/read).
+    """
+    notification = await mark_notification_read(
+        notification_id=notification_id,
+        user_id=current_user.id,
+        db=db,
+    )
+    return {**_to_dict(NotificationResponse.model_validate(notification)), "message": "Marked as read"}
 
 
 @router.put("/{notification_id}/read", status_code=status.HTTP_200_OK)
@@ -164,248 +387,89 @@ async def websocket_notifications_endpoint(websocket: WebSocket, user_id: str) -
     """
     WebSocket endpoint for real-time push notifications.
 
-    Maintains an active connection per user and sends notifications as they occur.
-    Implements keepalive mechanism to detect stale connections.
-
-    Args:
-        websocket: WebSocket connection object
-        user_id: ID of the user receiving notifications
-
-    Returns:
-        None (connection-based protocol)
-
-    Connection flow:
-        1. Client connects → receive welcome message
-        2. Server sends ping every 30 seconds
-        3. Client can send "pong" to acknowledge
-        4. On disconnect → cleanup
+    Path may be email or UUID. Optional ``?token=`` registers both email and UUID
+    aliases so pushes keyed by either identifier reach the client.
     """
+    connect_key = user_id.strip()
+    aliases: list[str] = []
+
+    token = websocket.query_params.get("token")
+    if token:
+        try:
+            from app.services.auth_service import decode_access_token
+            from app.database import SessionLocal
+
+            token_data = decode_access_token(token)
+            if token_data.email:
+                aliases.append(token_data.email)
+            if token_data.user_id:
+                aliases.append(str(token_data.user_id))
+            # Prefer UUID as primary when token provides it
+            if token_data.user_id and "@" in connect_key:
+                aliases.append(connect_key)
+                connect_key = str(token_data.user_id)
+        except Exception as error:
+            logger.debug("WS token alias resolve failed: %s", error)
+
+    # If path is email without token, look up UUID so UUID-keyed pushes still work
+    if "@" in connect_key and str(connect_key) not in aliases:
+        try:
+            from app.database import SessionLocal
+            db = SessionLocal()
+            try:
+                user = db.query(User).filter(User.email.ilike(connect_key)).first()
+                if user:
+                    aliases.append(str(user.id))
+                    aliases.append(user.email)
+            finally:
+                db.close()
+        except Exception as error:
+            logger.debug("WS email→UUID lookup failed: %s", error)
+
+    if "@" in connect_key:
+        aliases.append(connect_key.lower())
+
     try:
-        await manager.connect(user_id, websocket)
+        await manager.connect(connect_key, websocket, aliases=aliases)
 
         welcome_message = {
             "type": "connected",
             "message": "Connected to FlowCast alerts",
-            "user_id": user_id,
-            "timestamp": asyncio.get_event_loop().time(),
+            "user_id": connect_key,
+            "timestamp": to_ist_iso(),
         }
         await websocket.send_json(welcome_message)
 
-        logger.info("User %s connected to WebSocket notifications", user_id)
+        logger.info("User %s connected to WebSocket notifications", connect_key)
 
         while True:
             try:
-                # Wait for incoming message with 30 second timeout
                 data = await asyncio.wait_for(
                     websocket.receive_text(),
                     timeout=WEBSOCKET_KEEPALIVE_INTERVAL,
                 )
 
-                try:
-                    message = asyncio.run(asyncio.create_task(
-                        asyncio.to_thread(lambda: {"type": data})
-                    ))
-
-                    if data == "pong":
-                        logger.debug("Received pong from user %s", user_id)
-                        continue
-
-                except Exception:
-                    pass
+                if data == "pong":
+                    logger.debug("Received pong from user %s", connect_key)
+                    continue
 
             except asyncio.TimeoutError:
-                # Send keepalive ping when timeout occurs
-                await manager.send_ping(user_id)
+                await manager.send_ping(connect_key)
                 continue
 
             except WebSocketDisconnect:
-                manager.disconnect(user_id)
-                logger.info("User %s WebSocket disconnected", user_id)
+                manager.disconnect(connect_key)
+                logger.info("User %s WebSocket disconnected", connect_key)
                 break
 
             except Exception as error:
-                logger.error("WebSocket error for user %s: %s", user_id, error)
-                manager.disconnect(user_id)
+                logger.error("WebSocket error for user %s: %s", connect_key, error)
+                manager.disconnect(connect_key)
                 break
 
     except Exception as error:
-        logger.error("WebSocket connection failed for user %s: %s", user_id, error)
-        manager.disconnect(user_id)
-
-
-@router.get(
-    "/history",
-    response_model=NotificationSummary,
-    response_model_exclude_none=True,
-    status_code=status.HTTP_200_OK,
-)
-async def get_notification_history(
-    skip: int = Query(0, ge=0, description="Number of records to skip for pagination"),
-    limit: int = Query(20, ge=1, le=100, description="Maximum records to return"),
-    unread_only: bool = Query(False, description="Filter to unread notifications only"),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> NotificationSummary:
-    """
-    Get paginated notification history for the current authenticated user.
-
-    Supports filtering by unread status and pagination controls.
-
-    Args:
-        skip: Pagination offset (default: 0)
-        limit: Pagination limit (default: 20, max: 100)
-        unread_only: If True, return only unread notifications (default: False)
-        current_user: Authenticated user from JWT
-        db: Database session
-
-    Returns:
-        NotificationSummary with aggregated stats and paginated notifications
-
-    Response includes:
-        - total: total notifications for user
-        - unread: count of unread notifications
-        - critical: count of critical severity notifications
-        - notifications: paginated list of notification records
-    """
-    summary = await get_user_notifications(
-        user_id=current_user.id,
-        skip=skip,
-        limit=limit,
-        unread_only=unread_only,
-        db=db,
-    )
-
-    logger.info(
-        "User %s retrieved notification history (skip=%s, limit=%s, unread_only=%s)",
-        current_user.id,
-        skip,
-        limit,
-        unread_only,
-    )
-
-    return summary
-
-
-@router.post(
-    "/mark-read/{notification_id}",
-    response_model=NotificationResponse,
-    response_model_exclude_none=True,
-    status_code=status.HTTP_200_OK,
-)
-async def mark_notification_as_read(
-    notification_id: uuid.UUID,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> NotificationResponse:
-    """
-    Mark a single notification as read by the authenticated user.
-
-    Only the notification owner can mark it as read.
-
-    Args:
-        notification_id: ID of the notification to mark as read
-        current_user: Authenticated user from JWT
-        db: Database session
-
-    Returns:
-        Updated NotificationResponse
-
-    Raises:
-        HTTPException 404: Notification not found
-        HTTPException 403: User does not own this notification
-    """
-    notification = await mark_notification_read(
-        notification_id=notification_id,
-        user_id=current_user.id,
-        db=db,
-    )
-
-    return NotificationResponse.model_validate(notification)
-
-
-@router.post(
-    "/mark-all-read",
-    status_code=status.HTTP_200_OK,
-)
-async def mark_all_notifications_read(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> dict:
-    """
-    Mark all unread notifications as read for the current authenticated user.
-
-    Returns count of newly marked, already-read, and total notifications.
-    """
-    result = await mark_all_read(user_id=current_user.id, db=db)
-
-    marked  = result["marked_count"]
-    already = result["already_read_count"]
-    total   = result["total"]
-
-    return {
-        "message": (
-            f"{marked} notifications marked as read"
-            if marked > 0
-            else "All notifications were already read"
-        ),
-        "marked_count":       marked,
-        "already_read_count": already,
-        "total_notifications": total,
-        "user_id":   current_user.id,
-        "marked_at": result["marked_at"].isoformat(),
-    }
-
-
-@router.post(
-    "/test",
-    status_code=status.HTTP_201_CREATED,
-)
-async def send_test_notification(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> dict:
-    """
-    Create a sample notification for the current user.
-
-    Useful for verifying that the notification history and WebSocket delivery work.
-    """
-    from app.services.notification_service import create_notification
-    from app.services.connection_manager import manager as ws_manager
-    from app.services.notification_service import send_websocket_notification
-
-    severities = [
-        ("High Traffic Alert — Hitech City",   "Heavy congestion detected near Hitech City. Expect delays of 20-30 minutes.", "congestion_alert", "high",     "Hitech City"),
-        ("Moderate Delay — Gachibowli",        "Moderate traffic on your Gachibowli route. Allow extra 10 minutes.",          "congestion_alert", "medium",   "Gachibowli"),
-        ("Incident Reported — Ameerpet",       "Road incident reported near Ameerpet. Consider alternate routes.",             "incident_alert",   "critical", "Ameerpet"),
-    ]
-    import random
-    title, message, ntype, severity, location = random.choice(severities)
-
-    notification = await create_notification(
-        user_id=current_user.id,
-        route_id=None,
-        title=title,
-        message=message,
-        notification_type=ntype,
-        severity=severity,
-        location=location,
-        db=db,
-    )
-    await send_websocket_notification(
-        user_id=current_user.id,
-        notification=notification,
-        manager=ws_manager,
-        db=db,
-    )
-
-    logger.info("Test notification created for user %s", current_user.id)
-    return {
-        "message": "Test notification created successfully.",
-        "notification_id": notification.id,
-        "title":    notification.title,
-        "severity": notification.severity,
-        "location": notification.location,
-    }
+        logger.error("WebSocket connection failed for user %s: %s", connect_key, error)
+        manager.disconnect(connect_key)
 
 
 async def _seed_notifications(user_id: uuid.UUID, db: Session) -> None:
@@ -518,84 +582,6 @@ async def _seed_notifications(user_id: uuid.UUID, db: Session) -> None:
     except Exception as exc:
         db.rollback()
         logger.error("Notification seed failed for user %s: %s", user_id, exc)
-
-
-@router.get(
-    "/stats",
-    status_code=status.HTTP_200_OK,
-)
-async def get_notification_stats(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> dict:
-    """
-    Get notification statistics for the current authenticated user.
-
-    Auto-seeds 10 realistic notifications on first call when the table is empty.
-    Returns counts by read status, severity breakdown, type breakdown,
-    and the timestamp of the most recent notification.
-    """
-    uid = current_user.id
-
-    # Auto-seed realistic notifications for first-time users
-    existing = db.query(func.count(Notification.id)).filter(
-        Notification.user_id == uid
-    ).scalar() or 0
-    if existing == 0:
-        await _seed_notifications(uid, db)
-
-    # Single aggregated query for all counts
-    row = db.query(
-        func.count(Notification.id).label("total"),
-        func.sum(case((Notification.is_read.is_(False), 1), else_=0)).label("unread"),
-        func.sum(case((Notification.is_read.is_(True),  1), else_=0)).label("read"),
-        func.sum(case((Notification.severity == "critical", 1), else_=0)).label("critical"),
-        func.sum(case((Notification.severity == "high",     1), else_=0)).label("high"),
-        func.sum(case((Notification.severity == "medium",   1), else_=0)).label("medium"),
-        func.sum(case((Notification.severity == "low",      1), else_=0)).label("low"),
-        func.sum(case(((Notification.severity == "critical") & Notification.is_read.is_(False), 1), else_=0)).label("unread_critical"),
-        func.sum(case((Notification.notification_type == "congestion_alert", 1), else_=0)).label("congestion_alerts"),
-        func.sum(case((Notification.notification_type == "incident_alert",   1), else_=0)).label("incident_alerts"),
-        func.sum(case((Notification.notification_type == "route_update",     1), else_=0)).label("route_updates"),
-        func.sum(case((Notification.notification_type == "system",           1), else_=0)).label("system"),
-        func.max(Notification.created_at).label("last_at"),
-    ).filter(Notification.user_id == uid).one()
-
-    total         = int(row.total or 0)
-    unread_count  = int(row.unread or 0)
-    read_count    = int(row.read   or 0)
-
-    logger.info(
-        "User %s retrieved notification stats (total=%s, unread=%s, read=%s)",
-        uid, total, unread_count, read_count,
-    )
-
-    return {
-        "user_id":             uid,
-        # canonical names
-        "total_notifications": total,
-        "unread_count":        unread_count,
-        "read_count":          read_count,
-        # frontend aliases (stats.total / stats.unread / stats.unread_critical)
-        "total":               total,
-        "unread":              unread_count,
-        "unread_critical":     int(row.unread_critical or 0),
-        "severity_breakdown": {
-            "critical": int(row.critical or 0),
-            "high":     int(row.high     or 0),
-            "medium":   int(row.medium   or 0),
-            "low":      int(row.low      or 0),
-        },
-        "unread_critical":     int(row.unread_critical or 0),
-        "type_breakdown": {
-            "congestion_alert": int(row.congestion_alerts or 0),
-            "incident_alert":   int(row.incident_alerts   or 0),
-            "route_update":     int(row.route_updates     or 0),
-            "system":           int(row.system            or 0),
-        },
-        "last_notification_at":  row.last_at,
-        "active_ws_connections": manager.get_connection_count(),
-    }
 
 
 # ────────────────────────────────────────────────────────────────────────────────

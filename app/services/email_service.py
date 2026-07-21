@@ -125,7 +125,7 @@ def _send_email_sync(to_address: str, subject: str, html_body: str) -> bool:
 
     context = ssl.create_default_context()
     try:
-        with smtplib.SMTP(_SMTP_HOST, _SMTP_PORT, timeout=10) as server:
+        with smtplib.SMTP(_SMTP_HOST, _SMTP_PORT, timeout=1.2) as server:
             server.ehlo()
             server.starttls(context=context)
             server.login(_SMTP_USER, _SMTP_PASSWORD)
@@ -143,7 +143,12 @@ def _send_email_sync(to_address: str, subject: str, html_body: str) -> bool:
 async def send_email(to_address: str, subject: str, html_body: str) -> bool:
     """Async wrapper — runs SMTP in a thread so it doesn't block the event loop."""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _send_email_sync, to_address, subject, html_body)
+    future = loop.run_in_executor(None, _send_email_sync, to_address, subject, html_body)
+    try:
+        return await asyncio.wait_for(future, timeout=1.5)
+    except asyncio.TimeoutError:
+        logger.warning("Email delivery exceeded 1.5-second request budget: %s", subject)
+        return False
 
 
 # ── Typed helpers called by notification_service ──────────────────────────────

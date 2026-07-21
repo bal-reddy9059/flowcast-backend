@@ -2,9 +2,11 @@
 
 import logging
 import uuid
+from datetime import datetime, timezone
 from typing import Annotated, Optional
+from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -19,6 +21,30 @@ logger = logging.getLogger(__name__)
 _VALID_METRICS = {"congestion_level", "average_speed", "vehicle_count"}
 _VALID_OPERATORS = {">=", "<=", "==", ">", "<"}
 _CONGESTION_NUM = {"low": 1, "medium": 2, "high": 3}
+_IST = ZoneInfo("Asia/Kolkata")
+_OPERATOR_ALIASES = {
+    "equals": "==", "equal": "==", "eq": "==",
+    "gte": ">=", "lte": "<=", "gt": ">", "lt": "<",
+}
+_ACTION_ALIASES = {"send_notification": "notify", "notification": "notify"}
+
+
+def _canonical_operator(value: str) -> str:
+    clean = str(value).strip().lower()
+    return _OPERATOR_ALIASES.get(clean, clean)
+
+
+def _canonical_action(value: str) -> str:
+    clean = str(value).strip().lower()
+    return _ACTION_ALIASES.get(clean, clean)
+
+
+def _to_ist_iso(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(_IST).isoformat()
 
 
 class RuleCreate(BaseModel):
@@ -60,9 +86,13 @@ def create_rule(
     """
     if payload.condition_metric not in _VALID_METRICS:
         raise HTTPException(status_code=400, detail=f"condition_metric must be one of {_VALID_METRICS}")
-    if payload.condition_operator not in _VALID_OPERATORS:
+    operator = _canonical_operator(payload.condition_operator)
+    action = _canonical_action(payload.action_type)
+    if operator not in _VALID_OPERATORS:
         raise HTTPException(status_code=400, detail=f"condition_operator must be one of {_VALID_OPERATORS}")
-    if payload.action_type in ("webhook", "both") and not payload.action_webhook_id:
+    if action not in {"notify", "webhook", "both"}:
+        raise HTTPException(status_code=400, detail="action_type must be notify, webhook, or both")
+    if action in ("webhook", "both") and not payload.action_webhook_id:
         raise HTTPException(status_code=400, detail="action_webhook_id required when action_type includes webhook")
 
     rule = AlertRule(
@@ -71,10 +101,10 @@ def create_rule(
         name=payload.name,
         location=payload.location,
         condition_metric=payload.condition_metric,
-        condition_operator=payload.condition_operator,
+        condition_operator=operator,
         condition_value=payload.condition_value,
         duration_minutes=payload.duration_minutes,
-        action_type=payload.action_type,
+        action_type=action,
         action_webhook_id=payload.action_webhook_id,
         cooldown_minutes=payload.cooldown_minutes,
     )
@@ -89,9 +119,18 @@ def create_rule(
 def list_rules(
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)],
+    limit: int = Query(100, ge=1, le=200),
+    offset: int = Query(0, ge=0),
 ) -> dict:
     """List all alert rules for the current user."""
-    rules = db.query(AlertRule).filter(AlertRule.user_id == current_user.id).all()
+    rules = (
+        db.query(AlertRule)
+        .filter(AlertRule.user_id == current_user.id)
+        .order_by(AlertRule.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
     return {"rules": [_rule_dict(r) for r in rules], "total": len(rules)}
 
 
@@ -114,7 +153,7 @@ def get_rule(
         **_rule_dict(rule),
         "recent_triggers": [
             {
-                "triggered_at": e.triggered_at.isoformat(),
+                "triggered_at": _to_ist_iso(e.triggered_at),
                 "metric_value": e.metric_value,
                 "location": e.location,
             }
@@ -132,7 +171,18 @@ def update_rule(
 ) -> dict:
     """Update an alert rule."""
     rule = _get_rule_or_404(rule_id, current_user.id, db)
-    for field, value in payload.model_dump(exclude_none=True).items():
+    changes = payload.model_dump(exclude_none=True)
+    if "condition_metric" in changes and changes["condition_metric"] not in _VALID_METRICS:
+        raise HTTPException(status_code=400, detail=f"condition_metric must be one of {_VALID_METRICS}")
+    if "condition_operator" in changes:
+        changes["condition_operator"] = _canonical_operator(changes["condition_operator"])
+        if changes["condition_operator"] not in _VALID_OPERATORS:
+            raise HTTPException(status_code=400, detail=f"condition_operator must be one of {_VALID_OPERATORS}")
+    if "action_type" in changes:
+        changes["action_type"] = _canonical_action(changes["action_type"])
+        if changes["action_type"] not in {"notify", "webhook", "both"}:
+            raise HTTPException(status_code=400, detail="action_type must be notify, webhook, or both")
+    for field, value in changes.items():
         setattr(rule, field, value)
     db.commit()
     db.refresh(rule)
@@ -183,7 +233,7 @@ def rule_history(
     return {
         "rule_id": str(rule.id),
         "rule_name": rule.name,
-        "triggers": [{"triggered_at": e.triggered_at.isoformat(), "metric_value": e.metric_value} for e in evals],
+        "triggers": [{"triggered_at": _to_ist_iso(e.triggered_at), "metric_value": e.metric_value} for e in evals],
         "total": len(evals),
     }
 
@@ -203,6 +253,7 @@ def eval_condition(metric: str, operator: str, threshold: str, actual_value) -> 
             b = float(threshold)
         except (ValueError, TypeError):
             return False
+    operator = _canonical_operator(operator)
     if operator == ">=":   return a >= b
     if operator == "<=":   return a <= b
     if operator == "==":   return a == b
@@ -219,18 +270,19 @@ def _get_rule_or_404(rule_id, user_id, db) -> AlertRule:
 
 
 def _rule_dict(rule: AlertRule) -> dict:
+    operator = _canonical_operator(rule.condition_operator)
     return {
         "id": str(rule.id),
         "name": rule.name,
         "location": rule.location,
-        "condition": f"{rule.condition_metric} {rule.condition_operator} {rule.condition_value} for {rule.duration_minutes} min",
+        "condition": f"{rule.condition_metric} {operator} {rule.condition_value} for {rule.duration_minutes} min",
         "condition_metric": rule.condition_metric,
-        "condition_operator": rule.condition_operator,
+        "condition_operator": operator,
         "condition_value": rule.condition_value,
         "duration_minutes": rule.duration_minutes,
-        "action_type": rule.action_type,
+        "action_type": _canonical_action(rule.action_type),
         "cooldown_minutes": rule.cooldown_minutes,
         "is_active": rule.is_active,
-        "last_triggered_at": rule.last_triggered_at.isoformat() if rule.last_triggered_at else None,
-        "created_at": rule.created_at.isoformat(),
+        "last_triggered_at": _to_ist_iso(rule.last_triggered_at),
+        "created_at": _to_ist_iso(rule.created_at),
     }

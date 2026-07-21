@@ -22,9 +22,96 @@ from fastapi import HTTPException, status
 
 logger = logging.getLogger(__name__)
 
-CONGESTION_RADIUS_DEGREES = 0.5   # ~55 km — wide enough for district-level data
+CONGESTION_RADIUS_DEGREES = 0.05  # ~5.5 km — tight bbox; name lookup preferred
 CONGESTION_CHECK_INTERVAL = 60
 NOTIFICATION_COOLDOWN_MINUTES = 30
+
+
+def _latest_high_congestion_near_route(db: Session, route: SavedRoute) -> TrafficRecord | None:
+    """Fast congestion probe — indexed name first, then tiny geo bbox. Never raises."""
+    from sqlalchemy import text
+
+    since = datetime.now(timezone.utc) - timedelta(hours=2)
+    try:
+        db.execute(text("SET LOCAL statement_timeout = '600ms'"))
+        db.execute(text("SET LOCAL lock_timeout = '300ms'"))
+
+        # 1) Indexed equality on origin_name (preferred)
+        if route.origin_name:
+            row = (
+                db.query(TrafficRecord)
+                .filter(
+                    TrafficRecord.location == route.origin_name,
+                    TrafficRecord.created_at >= since,
+                )
+                .order_by(TrafficRecord.created_at.desc())
+                .limit(1)
+                .first()
+            )
+            if row and (row.congestion_level or "").lower() == "high":
+                return row
+            # Prefix match for "Hyderabad, Telangana" style names
+            row = (
+                db.query(TrafficRecord)
+                .filter(
+                    TrafficRecord.location.ilike(f"{route.origin_name.split(',')[0].strip()}%"),
+                    TrafficRecord.created_at >= since,
+                    TrafficRecord.congestion_level == "high",
+                )
+                .order_by(TrafficRecord.created_at.desc())
+                .limit(1)
+                .first()
+            )
+            if row:
+                return row
+
+        # 2) Small geo bbox — only fetch the columns we need
+        lat, lng = float(route.origin_lat), float(route.origin_lng)
+        r = CONGESTION_RADIUS_DEGREES
+        mapping = db.execute(
+            text(
+                """
+                SELECT location, congestion_level, created_at, average_speed, vehicle_count,
+                       latitude, longitude, id
+                FROM traffic_records
+                WHERE latitude BETWEEN :lat0 AND :lat1
+                  AND longitude BETWEEN :lng0 AND :lng1
+                  AND created_at >= :since
+                  AND congestion_level = 'high'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            ),
+            {
+                "lat0": lat - r,
+                "lat1": lat + r,
+                "lng0": lng - r,
+                "lng1": lng + r,
+                "since": since,
+            },
+        ).mappings().first()
+        if not mapping:
+            return None
+
+        # Lightweight stand-in so callers can use .location / .congestion_level
+        class _Snap:
+            pass
+
+        snap = _Snap()
+        for k, v in mapping.items():
+            setattr(snap, k, v)
+        return snap  # type: ignore[return-value]
+    except Exception as exc:
+        logger.warning(
+            "Congestion probe skipped for route %s: %s",
+            getattr(route, "id", "?"),
+            type(exc).__name__,
+        )
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return None
 
 
 async def create_notification(
@@ -109,25 +196,47 @@ async def send_websocket_notification(
     )
 
     # ── 1. WebSocket delivery ─────────────────────────────────────────────────
+    # Clients often connect with email; callers usually pass UUID — try both.
+    from app.utils.api_response import to_ist_iso
+
+    ws_keys = [str(user_id)]
+    try:
+        import uuid as _uuid
+        uid = user_id if isinstance(user_id, _uuid.UUID) else _uuid.UUID(str(user_id))
+        user_row = db.query(User).filter(User.id == uid).first()
+        if user_row and user_row.email:
+            ws_keys.append(user_row.email)
+            ws_keys.append(user_row.email.lower())
+    except (ValueError, AttributeError, TypeError):
+        # user_id may already be an email string
+        if "@" in str(user_id):
+            ws_keys.append(str(user_id).lower())
+
     ws_sent = False
     try:
         payload = WebSocketMessage(
             type="notification",
             data={
-                "id": notification.id,
+                "id": str(notification.id),
                 "title": notification.title,
                 "message": notification.message,
                 "severity": notification.severity,
+                "type": notification.notification_type,
                 "notification_type": notification.notification_type,
                 "location": notification.location,
-                "created_at": notification.created_at.isoformat(),
+                "created_at": to_ist_iso(notification.created_at),
             },
         )
-        await manager.send_to_user(user_id, payload.model_dump(mode="json"))
-        ws_sent = True
-        logger.info("WebSocket notification sent to user %s (id: %s)", user_id, notification.id)
-    except KeyError:
-        logger.warning("User %s not connected — WS notification %s not delivered", user_id, notification.id)
+        delivery_key = ",".join(dict.fromkeys(ws_keys))
+        ws_sent = await manager.send_to_user(delivery_key, payload.model_dump(mode="json"))
+        if ws_sent:
+            logger.info("WebSocket notification sent to user %s (id: %s)", user_id, notification.id)
+        else:
+            logger.warning(
+                "User %s not connected — WS notification %s not delivered",
+                user_id,
+                notification.id,
+            )
     except Exception as error:
         logger.error("WS notification error for user %s: %s", user_id, error)
 
@@ -182,48 +291,48 @@ async def check_saved_routes_for_congestion(db: Session, manager: Any) -> None:
     """
     Background task that checks all active saved routes for high congestion.
 
-    Runs periodically to detect congestion on user routes and send alerts.
-    Prevents spam by checking if alert was sent in the last 30 minutes.
-
-    Args:
-        db: Database session
-        manager: ConnectionManager for WebSocket delivery
-
-    Returns:
-        None (logs summary of alerts sent)
+    Critical: every DB read is followed by rollback() so we never sit
+    idle-in-transaction (that used to lock traffic_records for hours).
     """
     try:
         routes = db.query(SavedRoute).filter(SavedRoute.is_active.is_(True)).all()
+        snapshots = [
+            {
+                "id": r.id,
+                "user_id": r.user_id,
+                "route_name": r.route_name,
+                "origin_lat": r.origin_lat,
+                "origin_lng": r.origin_lng,
+                "origin_name": r.origin_name,
+            }
+            for r in routes
+        ]
+        db.rollback()  # release AccessShareLock immediately
 
-        if not routes:
+        if not snapshots:
             logger.debug("No active saved routes to check for congestion")
             return
 
         alerts_sent = 0
 
-        for route in routes:
-            try:
-                recent_traffic = (
-                    db.query(TrafficRecord)
-                    .filter(
-                        TrafficRecord.latitude.between(
-                            route.origin_lat - CONGESTION_RADIUS_DEGREES,
-                            route.origin_lat + CONGESTION_RADIUS_DEGREES,
-                        ),
-                        TrafficRecord.longitude.between(
-                            route.origin_lng - CONGESTION_RADIUS_DEGREES,
-                            route.origin_lng + CONGESTION_RADIUS_DEGREES,
-                        ),
-                        TrafficRecord.created_at >= datetime.now(timezone.utc) - timedelta(hours=2),
-                    )
-                    .order_by(TrafficRecord.created_at.desc())
-                    .first()
-                )
+        for snap in snapshots:
+            class _Route:
+                pass
 
-                if not recent_traffic or recent_traffic.congestion_level != "high":
+            route = _Route()
+            for k, v in snap.items():
+                setattr(route, k, v)
+
+            try:
+                recent_traffic = _latest_high_congestion_near_route(db, route)
+                db.rollback()
+
+                if not recent_traffic:
                     continue
 
-                cooldown_threshold = datetime.now(timezone.utc) - timedelta(minutes=NOTIFICATION_COOLDOWN_MINUTES)
+                cooldown_threshold = datetime.now(timezone.utc) - timedelta(
+                    minutes=NOTIFICATION_COOLDOWN_MINUTES
+                )
                 recent_alert = (
                     db.query(Notification)
                     .filter(
@@ -233,6 +342,7 @@ async def check_saved_routes_for_congestion(db: Session, manager: Any) -> None:
                     )
                     .first()
                 )
+                db.rollback()
 
                 if recent_alert:
                     logger.debug(
@@ -242,20 +352,22 @@ async def check_saved_routes_for_congestion(db: Session, manager: Any) -> None:
                     )
                     continue
 
+                loc_name = getattr(recent_traffic, "location", "your area")
                 notification = await create_notification(
                     user_id=route.user_id,
                     route_id=route.id,
                     title=f"High Traffic Alert — {route.route_name}",
                     message=(
-                        f"Heavy congestion detected near {recent_traffic.location} "
+                        f"Heavy congestion detected near {loc_name} "
                         f"on your {route.route_name} route. "
                         f"Expect significant delays."
                     ),
                     notification_type="congestion_alert",
                     severity="high",
-                    location=recent_traffic.location,
+                    location=loc_name,
                     db=db,
                 )
+                db.rollback()
 
                 sent = await send_websocket_notification(
                     user_id=str(route.user_id),
@@ -263,26 +375,35 @@ async def check_saved_routes_for_congestion(db: Session, manager: Any) -> None:
                     manager=manager,
                     db=db,
                 )
+                db.rollback()
 
                 if sent:
                     alerts_sent += 1
 
             except Exception as error:
-                logger.error(
+                logger.warning(
                     "Error checking congestion for route %s: %s",
-                    route.id,
-                    error,
+                    getattr(route, "id", "?"),
+                    type(error).__name__,
                 )
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
                 continue
 
         logger.info(
             "Congestion check completed: scanned %s routes — %s alerts sent",
-            len(routes),
+            len(snapshots),
             alerts_sent,
         )
 
     except Exception as error:
-        logger.error("Background congestion check failed: %s", error)
+        logger.error("Background congestion check failed: %s", type(error).__name__)
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
 
 async def get_user_notifications(

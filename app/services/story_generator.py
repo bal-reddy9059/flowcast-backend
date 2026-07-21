@@ -303,7 +303,6 @@ async def refresh_stories(db) -> list[dict]:
         .all()
     )
 
-    # Try Claude AI first
     lines = []
     for r in high_records[:6]:
         lines.append(f"{r.congestion_level} congestion at {r.location}, speed={r.average_speed} km/h")
@@ -312,8 +311,12 @@ async def refresh_stories(db) -> list[dict]:
     for inc in incidents:
         lines.append(f"Incident: {inc.incident_type} at {inc.location}, severity={inc.severity}")
 
-    if lines:
-        ai_stories = generate_stories("\n".join(lines))
+    # AI skipped unless AI_ENABLED=true and a real sk- key is set
+    from app.services.ai_service import is_ai_available, generate_stories
+    import asyncio
+
+    if lines and is_ai_available():
+        ai_stories = await asyncio.to_thread(generate_stories, "\n".join(lines))
         if ai_stories:
             stamped = []
             for s in ai_stories:
@@ -332,12 +335,12 @@ async def refresh_stories(db) -> list[dict]:
             logger.info("Generated %d AI traffic stories", len(stamped))
             return _story_cache
 
-    # Fallback: rule-based stories from DB data
+    # Rule-based stories (default when AI is skipped)
     fallback = _build_fallback_stories(high_records, medium_records, low_records, incidents)
     if fallback:
         _story_cache = fallback
         _last_generated = now
-        logger.info("Generated %d fallback traffic stories (no AI)", len(fallback))
+        logger.info("Generated %d rule-based traffic stories (AI skipped)", len(fallback))
         return _story_cache
 
     # Nothing in DB — serve last cache or placeholder

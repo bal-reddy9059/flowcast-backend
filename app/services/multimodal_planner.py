@@ -79,9 +79,10 @@ def _build_rule_plan(
     db: Session,
 ) -> dict:
     """Build a realistic multi-modal plan from rules — no API key needed."""
+    from zoneinfo import ZoneInfo
     segments = []
-    now = datetime.now(timezone.utc)
-    hour = now.hour
+    now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+    hour = now_ist.hour
     is_peak = (7 <= hour <= 10) or (17 <= hour <= 21)
 
     metro_info = _METRO_CITIES.get(city) if city else None
@@ -326,31 +327,28 @@ def build_journey_context(
     dest_lat: float, dest_lng: float,
     distance_km: float, db: Session,
 ) -> str:
+    from zoneinfo import ZoneInfo
+    now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
     lines = [
         f"Origin: {origin} (lat={origin_lat}, lng={origin_lng})",
         f"Destination: {destination} (lat={dest_lat}, lng={dest_lng})",
         f"Straight-line distance: {distance_km:.1f} km",
-        f"Current time (IST): {datetime.now(timezone.utc).strftime('%A %H:%M')}",
+        f"Current time (IST): {now_ist.strftime('%A %H:%M')}",
+        f"Driving ETA: ~{round(distance_km / 28 * 60)} min (estimated)",
     ]
-    try:
-        from app.services.eta_service import calculate_eta_for_location
-        eta = calculate_eta_for_location(origin, distance_km, "driving", db)
-        lines.append(f"Driving ETA: {round(eta.eta_minutes)} min, congestion={eta.congestion_level}")
-    except Exception:
-        lines.append(f"Driving ETA: ~{round(distance_km / 28 * 60)} min (estimated)")
 
     city = _detect_city(origin, destination)
     metro_info = _METRO_CITIES.get(city) if city else None
     if metro_info:
         lines.append(f"Metro available ({city.title()}): {', '.join(metro_info['lines'][:2])}")
-        lines.append(f"Metro fare: base ₹{metro_info['base_fare']} + ₹{metro_info['per_km']}/km")
+        lines.append(f"Metro fare: base Rs {metro_info['base_fare']} + Rs {metro_info['per_km']}/km")
     else:
         lines.append("Metro: not available for this route")
 
     lines += [
-        "Auto-rickshaw: ₹20 base + ₹15/km",
-        "App-cab (Ola/Uber): ₹14-18/km + possible peak surge",
-        "Bus: ₹5-25 flat",
+        "Auto-rickshaw: Rs 20 base + Rs 15/km",
+        "App-cab (Ola/Uber): Rs 14-18/km + possible peak surge",
+        "Bus: Rs 5-25 flat",
         "Walking: suitable under 2km at 5 km/h",
     ]
     return "\n".join(lines)
@@ -362,42 +360,97 @@ def get_multimodal_plan(
     dest_lat: float, dest_lng: float,
     distance_km: float, db: Session,
 ) -> dict:
-    """Generate a multi-modal plan. Uses Claude AI if key is set, falls back to rule engine."""
-    from app.services.ai_service import generate_multimodal_plan
+    """Generate a multi-modal plan. Uses Claude AI if key is set, falls back to rule engine.
 
+    Always returns a frontend-friendly payload with both nested `plan` and top-level
+    `segments` / `summary` aliases so clients that expect either shape work.
+    """
+    from zoneinfo import ZoneInfo
+    from app.services.ai_service import generate_multimodal_plan, is_ai_available
+
+    _IST = ZoneInfo("Asia/Kolkata")
     now = datetime.now(timezone.utc)
+    now_ist = now.astimezone(_IST)
 
-    # Detect city and live congestion
+    # Detect city — prefer shared NCR metro when trip spans Delhi/Gurgaon/Noida
     city = _detect_city(origin, destination)
+    text = f"{origin} {destination}".lower()
+    if any(k in text for k in ("gurgaon", "gurugram", "noida", "faridabad")) and any(
+        k in text for k in ("delhi", "connaught", "cp", "dwarka", "saket", "airport")
+    ):
+        city = "delhi"
+
+    # Fast congestion hint — never block the planner on slow ETA/DB
     congestion = "medium"
     try:
-        from app.services.eta_service import calculate_eta_for_location
-        eta = calculate_eta_for_location(origin, distance_km, "driving", db)
-        congestion = eta.congestion_level or "medium"
+        from app.services.weather_service import weather_impact_for_location
+        impact = weather_impact_for_location(origin)
+        mod = impact.get("congestion_modifier", "none")
+        congestion = {"none": "low", "light": "low", "moderate": "medium", "severe": "high"}.get(mod, "medium")
     except Exception:
-        pass
+        hour = now_ist.hour
+        if (7 <= hour <= 10) or (17 <= hour <= 21):
+            congestion = "high"
 
-    # Try Claude AI first
-    context = build_journey_context(origin, destination, origin_lat, origin_lng, dest_lat, dest_lng, distance_km, db)
-    ai_plan = generate_multimodal_plan(context)
+    plan: dict
+    ai_enhanced = False
 
-    if "error" not in ai_plan and ai_plan.get("segments"):
-        logger.info("AI multimodal plan: %s to %s (%.1f km)", origin, destination, distance_km)
-        return {
-            "origin": origin,
-            "destination": destination,
-            "distance_km": distance_km,
-            "plan": {**ai_plan, "source": "ai"},
-            "generated_at": now.isoformat(),
-        }
+    if is_ai_available():
+        context = build_journey_context(
+            origin, destination, origin_lat, origin_lng, dest_lat, dest_lng, distance_km, db
+        )
+        ai_plan = generate_multimodal_plan(context)
+        if "error" not in ai_plan and ai_plan.get("segments"):
+            plan = {**ai_plan, "source": "ai"}
+            ai_enhanced = True
+            logger.info("AI multimodal plan: %s to %s (%.1f km)", origin, destination, distance_km)
+        else:
+            plan = _build_rule_plan(origin, destination, distance_km, city, congestion, db)
+            logger.info(
+                "AI plan unavailable (%s) — rule fallback: %s to %s",
+                ai_plan.get("error", "empty"), origin, destination,
+            )
+    else:
+        plan = _build_rule_plan(origin, destination, distance_km, city, congestion, db)
+        logger.info(
+            "Rule-based multimodal plan: %s to %s (%.1f km, city=%s)",
+            origin, destination, distance_km, city,
+        )
 
-    # Fallback to rule-based plan
-    rule_plan = _build_rule_plan(origin, destination, distance_km, city, congestion, db)
-    logger.info("Rule-based multimodal plan: %s to %s (%.1f km, city=%s)", origin, destination, distance_km, city)
+    # Guarantee segments exist for distinct places (never leave frontend with empty plan)
+    if distance_km >= 0.05 and not plan.get("segments"):
+        plan = _build_rule_plan(origin, destination, max(distance_km, 1.0), city, congestion, db)
+
     return {
         "origin": origin,
         "destination": destination,
-        "distance_km": distance_km,
-        "plan": rule_plan,
-        "generated_at": now.isoformat(),
+        "distance_km": round(distance_km, 2),
+        "ai_available": is_ai_available(),
+        "ai_enhanced": ai_enhanced,
+        "source": plan.get("source", "rule_based"),
+        "message": (
+            "AI-enhanced multi-modal plan"
+            if ai_enhanced
+            else "Journey plan ready (rule-based multi-modal)."
+        ),
+        "ai_hint": (
+            None if ai_enhanced
+            else "Optional: set AI_ENABLED=true and ANTHROPIC_API_KEY for Claude-enhanced plans."
+        ),
+        # Nested object (existing contract)
+        "plan": plan,
+        # Flattened aliases — many UIs look for these at the top level
+        "segments": plan.get("segments", []),
+        "summary": plan.get("summary"),
+        "total_duration_min": plan.get("total_duration_min"),
+        "total_cost_inr": plan.get("total_cost_inr"),
+        "vs_driving_only_min": plan.get("vs_driving_only_min"),
+        "carbon_saved_kg": plan.get("carbon_saved_kg"),
+        "drive_only": plan.get("drive_only"),
+        "city_detected": plan.get("city_detected"),
+        "metro_available": plan.get("metro_available"),
+        "peak_hour": plan.get("peak_hour"),
+        # Array form some clients expect
+        "plans": [plan],
+        "generated_at": now_ist.isoformat(),
     }

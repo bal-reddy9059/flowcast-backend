@@ -23,78 +23,81 @@ def _label_for(score: int) -> tuple:
 
 
 def _fetch_records(location: str, db, since):
-    """Try progressively wider location matches until we find records."""
+    """Fetch likely location matches in one bounded database query."""
     from app.models.predictor import TrafficRecord
     from app.services.city_aliases import location_filter
+    from sqlalchemy import or_
 
-    # 1. Exact / alias match on full string
+    now = datetime.now(timezone.utc)
+
+    def _with_age(records, matched):
+        if not records:
+            return records, matched, None
+        latest = max((r.timestamp or r.created_at for r in records if (r.timestamp or r.created_at)), default=None)
+        if latest is None:
+            age = None
+        else:
+            if latest.tzinfo is None:
+                latest = latest.replace(tzinfo=timezone.utc)
+            age = max(0, round((now - latest).total_seconds() / 3600, 1))
+        return records, matched, age
+
+    candidates = [location]
+    try:
+        from app.routes.route import _geocode
+        geo = _geocode(location)
+        if geo:
+            candidates.insert(0, geo["name"])
+    except Exception:
+        pass
+
+    candidates.extend(p.strip() for p in location.split(",") if len(p.strip()) > 2)
+    candidates.extend(
+        word for word in location.replace(",", " ").split() if len(word) > 3
+    )
+    candidates = list(dict.fromkeys(candidate for candidate in candidates if candidate))
+    conditions = [location_filter(TrafficRecord.location, candidate) for candidate in candidates]
+    since_24h = now - timedelta(hours=24)
     records = (
         db.query(TrafficRecord)
-        .filter(location_filter(TrafficRecord.location, location), TrafficRecord.created_at >= since)
-        .order_by(TrafficRecord.created_at.desc())
-        .limit(20)
+        .filter(or_(*conditions), TrafficRecord.timestamp >= since_24h)
+        .order_by(TrafficRecord.timestamp.desc())
+        .limit(100)
         .all()
     )
-    if records:
-        return records, location
+    if not records:
+        return [], location, None
 
-    # 2. Try each comma-separated part individually (e.g. "Silk Board, Bangalore" → "Silk Board")
-    parts = [p.strip() for p in location.split(",") if len(p.strip()) > 2]
-    for part in parts:
-        records = (
-            db.query(TrafficRecord)
-            .filter(location_filter(TrafficRecord.location, part), TrafficRecord.created_at >= since)
-            .order_by(TrafficRecord.created_at.desc())
-            .limit(20)
-            .all()
-        )
-        if records:
-            return records, part
-
-    # 3. Widen time window to 24 h and retry with each part
-    since_24h = datetime.now(timezone.utc) - timedelta(hours=24)
-    for part in [location] + parts:
-        records = (
-            db.query(TrafficRecord)
-            .filter(location_filter(TrafficRecord.location, part), TrafficRecord.created_at >= since_24h)
-            .order_by(TrafficRecord.created_at.desc())
-            .limit(20)
-            .all()
-        )
-        if records:
-            return records, part
-
-    # 4. Raw ILIKE on any word in the location string
-    words = [w for w in location.replace(",", " ").split() if len(w) > 3]
-    for word in words:
-        records = (
-            db.query(TrafficRecord)
-            .filter(TrafficRecord.location.ilike(f"%{word}%"), TrafficRecord.created_at >= since_24h)
-            .order_by(TrafficRecord.created_at.desc())
-            .limit(20)
-            .all()
-        )
-        if records:
-            return records, word
-
-    return [], location
+    recent = []
+    for record in records:
+        observed_at = record.timestamp or record.created_at
+        if observed_at and observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=timezone.utc)
+        if observed_at and observed_at >= since:
+            recent.append(record)
+    selected = (recent or records)[:20]
+    matched = selected[0].location if selected else location
+    return _with_age(selected, matched)
 
 
 def _fetch_incidents(location: str, db) -> int:
-    """Count active incidents, trying same fallback strategy."""
+    """Count recent active incidents near the location."""
     from app.models.predictor import Incident
     from app.services.city_aliases import location_filter
+    from sqlalchemy import or_
 
+    since = datetime.now(timezone.utc) - timedelta(hours=6)
     parts = [location] + [p.strip() for p in location.split(",") if len(p.strip()) > 2]
-    for part in parts:
-        count = (
-            db.query(Incident)
-            .filter(location_filter(Incident.location, part), Incident.is_active.is_(True))
-            .count()
+    conditions = [location_filter(Incident.location, part) for part in dict.fromkeys(parts)]
+    return (
+        db.query(Incident)
+        .filter(
+            or_(*conditions),
+            Incident.is_active.is_(True),
+            Incident.reported_at >= since,
         )
-        if count:
-            return count
-    return 0
+        .count()
+    )
 
 
 def calculate_stress_score(
@@ -105,35 +108,42 @@ def calculate_stress_score(
     user_id: str = None,
 ) -> dict:
     """Calculate a commute stress score (0 = calm, 100 = intense) for a route right now."""
+    from collections import Counter
     from app.services.eta_service import get_speed_for_congestion
 
     now = datetime.now(timezone.utc)
     since_1h = now - timedelta(hours=1)
 
-    records, matched_location = _fetch_records(location, db, since_1h)
+    records, matched_location, data_age_hours = _fetch_records(location, db, since_1h)
     active_incidents = _fetch_incidents(location, db)
-    data_age_hours = 1 if matched_location == location else 24
 
     if not records:
-        # Absolute fallback — infer from city-level if possible
         return _fallback_score(location, active_incidents, now)
 
-    congestion_levels = [r.congestion_level for r in records if r.congestion_level]
+    congestion_levels = [r.congestion_level for r in records if r.congestion_level in ("low", "medium", "high")]
     speeds = [r.average_speed for r in records if r.average_speed]
 
-    # ── Duration component (0–40 pts) ─────────────────────────────────────────
-    current_congestion = congestion_levels[0] if congestion_levels else "medium"
-    current_speed = speeds[0] if speeds else get_speed_for_congestion("medium", mode)
+    # Majority congestion (not just the newest row)
+    if congestion_levels:
+        current_congestion = Counter(congestion_levels).most_common(1)[0][0]
+    else:
+        current_congestion = "medium"
+
+    avg_speed = sum(speeds) / len(speeds) if speeds else get_speed_for_congestion(current_congestion, mode)
     free_flow_speed = get_speed_for_congestion("low", mode)
     expected_eta = (distance_km / max(free_flow_speed, 1)) * 60
-    current_eta  = (distance_km / max(current_speed, 1)) * 60
+    current_eta = (distance_km / max(avg_speed, 1)) * 60
     pct_over = max(0, (current_eta - expected_eta) / max(expected_eta, 1) * 100)
-    duration_pts = min(40, pct_over * 0.7)
 
-    # ── Incident component (0–25 pts) ─────────────────────────────────────────
+    # Cap duration stress when stored congestion is already low (speed estimate noise)
+    duration_pts = min(40, pct_over * 0.7)
+    if current_congestion == "low":
+        duration_pts = min(duration_pts, 18)
+    elif current_congestion == "medium":
+        duration_pts = min(duration_pts, 28)
+
     incident_pts = min(25, active_incidents * 9)
 
-    # ── Speed variability (0–20 pts) ──────────────────────────────────────────
     variability_pts = 0.0
     speed_var_label = "low"
     if len(speeds) > 2:
@@ -146,37 +156,33 @@ def calculate_stress_score(
         elif std > 4:
             variability_pts, speed_var_label = 6.0, "low"
 
-    # ── Congestion component (0–15 pts) ───────────────────────────────────────
     high_count = congestion_levels.count("high")
     congestion_pts = min(15, (high_count / max(len(congestion_levels), 1)) * 15)
 
     score = min(100, round(duration_pts + incident_pts + variability_pts + congestion_pts))
     label_entry = _label_for(score)
 
-    # ── Personal comparison ────────────────────────────────────────────────────
     personal_comparison = None
     if user_id:
         from app.models.trip import TripHistory
-        past = (
-            db.query(TripHistory)
+        from sqlalchemy import func
+        avg_past = (
+            db.query(func.avg(TripHistory.predicted_eta_minutes))
             .filter(
                 TripHistory.user_id == user_id,
                 TripHistory.origin_name.ilike(f"%{matched_location}%"),
                 TripHistory.created_at >= now - timedelta(days=30),
             )
-            .all()
+            .scalar()
         )
-        if past:
-            past_etas = [t.predicted_eta_minutes for t in past if t.predicted_eta_minutes]
-            if past_etas:
-                avg_past = sum(past_etas) / len(past_etas)
-                diff = round(current_eta - avg_past, 1)
-                if diff > 2:
-                    personal_comparison = f"{abs(diff):.0f} min longer than your usual commute here"
-                elif diff < -2:
-                    personal_comparison = f"{abs(diff):.0f} min faster than your usual commute here"
-                else:
-                    personal_comparison = "About the same as your usual commute here"
+        if avg_past is not None:
+            diff = round(current_eta - float(avg_past), 1)
+            if diff > 2:
+                personal_comparison = f"{abs(diff):.0f} min longer than your usual commute here"
+            elif diff < -2:
+                personal_comparison = f"{abs(diff):.0f} min faster than your usual commute here"
+            else:
+                personal_comparison = "About the same as your usual commute here"
 
     tips = {
         "Calm":      "Perfect time to travel — enjoy the open road.",
@@ -186,7 +192,7 @@ def calculate_stress_score(
     }
 
     logger.info(
-        "Stress score for '%s' (matched '%s', %d records, age=%dh): %d (%s)",
+        "Stress score for '%s' (matched '%s', %d records, age=%s): %d (%s)",
         location, matched_location, len(records), data_age_hours, score, label_entry[2],
     )
     return {
@@ -201,7 +207,7 @@ def calculate_stress_score(
             "active_incidents": active_incidents,
             "speed_variability": speed_var_label,
             "congestion_level": current_congestion,
-            "avg_speed_kmh": round(sum(speeds) / len(speeds), 1) if speeds else None,
+            "avg_speed_kmh": round(avg_speed, 1) if speeds else None,
             "records_used": len(records),
             "data_age_hours": data_age_hours,
         },

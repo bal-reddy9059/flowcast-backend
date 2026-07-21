@@ -4,8 +4,8 @@ import logging
 import math
 from typing import Annotated, Optional
 
-from fastapi import APIRouter, Depends, Query, status
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -83,10 +83,24 @@ def _resolve_coords(name: str) -> Optional[tuple[float, float]]:
     key = name.strip().lower()
     if key in _LOCATION_COORDS:
         return _LOCATION_COORDS[key]
-    # Partial match — return first hit
+    # Prefer longest partial match from local table
+    best = None
+    best_len = 0
     for k, v in _LOCATION_COORDS.items():
         if k in key or key in k:
-            return v
+            if len(k) > best_len:
+                best_len = len(k)
+                best = v
+    if best:
+        return best
+    # Fall back to shared India geocoder used by routes/optimize
+    try:
+        from app.routes.route import _geocode
+        loc = _geocode(name)
+        if loc:
+            return (float(loc["lat"]), float(loc["lng"]))
+    except Exception as exc:
+        logger.debug("Shared geocode failed for %s: %s", name, exc)
     return None
 
 
@@ -101,40 +115,55 @@ def _haversine(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
 
 # ── Request body ──────────────────────────────────────────────────────────────
 
-_PLACEHOLDER_VALUES = {"string", "text", "foo", "bar", "example", "test", "origin", "destination", "location", "place"}
+_PLACEHOLDER_VALUES = {
+    "string", "text", "foo", "bar", "example", "test",
+    "origin", "destination", "location", "place", "from", "to",
+}
 
 
 class MultimodalRequest(BaseModel):
-    model_config = ConfigDict(json_schema_extra={
-        "example": {
-            "origin": "Andheri East",
-            "destination": "BKC",
-        }
-    })
+    model_config = ConfigDict(
+        populate_by_name=True,
+        json_schema_extra={
+            "example": {
+                "origin": "Andheri East",
+                "destination": "BKC",
+            }
+        },
+    )
 
-    origin: str = Field(
-        ..., min_length=2,
-        description="Origin location name (Indian city neighbourhood, station, or landmark)",
-    )
-    destination: str = Field(
-        ..., min_length=2,
-        description="Destination name",
-    )
-    origin_lat: Optional[float] = Field(None, ge=6.0, le=37.5, description="Origin latitude (optional — auto-resolved if omitted)")
-    origin_lng: Optional[float] = Field(None, ge=68.0, le=97.5, description="Origin longitude (optional)")
-    dest_lat: Optional[float] = Field(None, ge=6.0, le=37.5, description="Destination latitude (optional)")
-    dest_lng: Optional[float] = Field(None, ge=68.0, le=97.5, description="Destination longitude (optional)")
+    origin: Optional[str] = Field(None, min_length=2, description="Origin location name")
+    destination: Optional[str] = Field(None, min_length=2, description="Destination name")
+    # Frontend aliases
+    from_: Optional[str] = Field(None, alias="from", min_length=2)
+    to: Optional[str] = Field(None, min_length=2)
+    origin_lat: Optional[float] = Field(None, ge=6.0, le=37.5)
+    origin_lng: Optional[float] = Field(None, ge=68.0, le=97.5)
+    dest_lat: Optional[float] = Field(None, ge=6.0, le=37.5)
+    dest_lng: Optional[float] = Field(None, ge=68.0, le=97.5)
+    destination_lat: Optional[float] = Field(None, ge=6.0, le=37.5)
+    destination_lng: Optional[float] = Field(None, ge=68.0, le=97.5)
     depart_at: Optional[str] = Field(None, description="ISO-8601 departure time (optional)")
 
-    @field_validator("origin", "destination")
-    @classmethod
-    def reject_placeholder_names(cls, v: str) -> str:
-        if v.strip().lower() in _PLACEHOLDER_VALUES:
-            raise ValueError(
-                f"'{v}' is not a valid location. "
-                "Use a recognised Indian city/neighbourhood (e.g. 'Andheri East', 'BKC', 'Koramangala')."
-            )
-        return v
+    @model_validator(mode="after")
+    def resolve_names(self):
+        origin = (self.origin or self.from_ or "").strip()
+        destination = (self.destination or self.to or "").strip()
+        if not origin or not destination:
+            raise ValueError("origin/from and destination/to are required")
+        for label, value in (("origin", origin), ("destination", destination)):
+            if value.lower() in _PLACEHOLDER_VALUES:
+                raise ValueError(
+                    f"'{value}' is not a valid {label}. "
+                    "Use a recognised Indian neighbourhood (e.g. 'Andheri East', 'BKC')."
+                )
+        self.origin = origin
+        self.destination = destination
+        if self.dest_lat is None and self.destination_lat is not None:
+            self.dest_lat = self.destination_lat
+        if self.dest_lng is None and self.destination_lng is not None:
+            self.dest_lng = self.destination_lng
+        return self
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -219,13 +248,22 @@ def _run_plan(
     o_coords = (origin_lat, origin_lng) if (origin_lat and origin_lng) else _resolve_coords(origin)
     d_coords = (dest_lat, dest_lng) if (dest_lat and dest_lng) else _resolve_coords(destination)
 
-    # Default to approximate India centre if completely unknown
+    missing = []
     if o_coords is None:
-        o_coords = (20.5937, 78.9629)
-        logger.warning("Could not resolve coords for '%s' — using India default", origin)
+        missing.append(f"origin '{origin}'")
     if d_coords is None:
-        d_coords = (20.5937, 78.9629)
-        logger.warning("Could not resolve coords for '%s' — using India default", destination)
+        missing.append(f"destination '{destination}'")
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "location_not_found",
+                "message": (
+                    "Could not resolve " + " and ".join(missing) + ". "
+                    "Try a known neighbourhood (Andheri East, BKC, Gachibowli, Connaught Place)."
+                ),
+            },
+        )
 
     o_lat, o_lng = o_coords
     d_lat, d_lng = d_coords
@@ -242,5 +280,11 @@ def _run_plan(
         db=db,
     )
 
-    logger.info("Multimodal plan: %s → %s (%.1f km, user=%s)", origin, destination, distance_km, user.id if user else "anon")
+    logger.info(
+        "Multimodal plan: %s → %s (%.1f km, segments=%d, source=%s, user=%s)",
+        origin, destination, distance_km,
+        len(result.get("segments") or []),
+        result.get("source"),
+        getattr(user, "id", "anon"),
+    )
     return result

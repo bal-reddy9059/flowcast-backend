@@ -1,19 +1,25 @@
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import desc, func
+from sqlalchemy import case, desc, func
 from typing import Optional, List
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from datetime import datetime, timedelta, timezone
-from collections import Counter
+from zoneinfo import ZoneInfo
+import asyncio
 import csv
 import io
 import random
 
 from app.database import get_db
-from app.models.predictor import TrafficRecord, PredictionResult, Incident
+from app.models.predictor import TrafficRecord, PredictionResult, Incident, _new_uuid
 from app.services.prediction_service import predict_traffic_congestion, save_prediction
-from app.services.realtime import classify_congestion
+from app.services.realtime import classify_congestion as classify_by_count_speed
+from app.services.traffic_flow_service import fetch_flow
+from app.services.tomtom_service import (
+    classify_congestion as classify_by_speed_ratio,
+    estimate_vehicle_count,
+)
 from app.services.city_aliases import CITY_ALIASES as _CITY_ALIASES, location_filter as _location_filter_fn
 from app.services.incident_seeder import (
     _INCIDENT_SEEDS,
@@ -23,29 +29,147 @@ from app.services.incident_seeder import (
 
 router = APIRouter(prefix="/traffic", tags=["Traffic"])
 
+_IST = ZoneInfo("Asia/Kolkata")
+ALLOWED_CONGESTION = {"low", "medium", "high"}
+CONGESTION_ALIASES = {
+    "moderate": "medium",
+    "normal": "medium",
+    "very_high": "high",
+    "severe": "high",
+    "critical": "high",
+    "very_low": "low",
+    "light": "low",
+    "clear": "low",
+    "free_flow": "low",
+}
+ALLOWED_ROAD_TYPES = {"arterial", "highway", "local", "expressway", "junction", None}
+
+
+def _normalize_congestion_level(value: str | None) -> str | None:
+    if value is None:
+        return None
+    level = value.strip().lower().replace("-", "_").replace(" ", "_")
+    return CONGESTION_ALIASES.get(level, level)
+
+
+def _to_ist_iso(dt: datetime | None) -> str | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(_IST).isoformat()
+
+
+async def _resolve_record_fields(
+    data: dict,
+    *,
+    live: bool,
+) -> tuple[dict, str]:
+    """
+    Fill traffic metrics from HERE/TomTom when live=true and coordinates exist.
+    Returns (resolved_data, data_source).
+    """
+    source = "manual"
+    lat, lng = data.get("latitude"), data.get("longitude")
+    has_coords = lat is not None and lng is not None
+
+    if live and has_coords:
+        flow = await fetch_flow(float(lat), float(lng))
+        if flow:
+            cur = float(flow["currentSpeed"])
+            free = float(flow["freeFlowSpeed"])
+            data["average_speed"] = round(cur, 1)
+            data["vehicle_count"] = estimate_vehicle_count(cur, free)
+            data["congestion_level"] = classify_by_speed_ratio(cur, free)
+            source = flow.get("source", "live")
+        elif data.get("average_speed") is None:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "Live traffic API unavailable",
+                    "message": "Configure HERE_API_KEY or TOMTOM_API_KEY, or set live=false with manual metrics.",
+                },
+            )
+
+    # Derive missing fields from partial manual input
+    if data.get("vehicle_count") is None and data.get("average_speed") is not None:
+        speed = float(data["average_speed"])
+        data["vehicle_count"] = estimate_vehicle_count(speed, max(speed * 1.5, 60.0))
+
+    if data.get("congestion_level") is None and data.get("vehicle_count") is not None:
+        data["congestion_level"] = classify_by_count_speed(
+            int(data["vehicle_count"]),
+            data.get("average_speed"),
+        )
+
+    if data.get("vehicle_count") is None:
+        data["vehicle_count"] = 0
+
+    level = _normalize_congestion_level(data.get("congestion_level")) or "medium"
+    if level not in ALLOWED_CONGESTION:
+        raise HTTPException(
+            status_code=422,
+            detail=f"congestion_level must be one of: {', '.join(sorted(ALLOWED_CONGESTION))}",
+        )
+    data["congestion_level"] = level
+
+    return data, source
+
+
+def _new_traffic_record(data: dict, source: str, now: datetime) -> TrafficRecord:
+    """Create a TrafficRecord with a guaranteed UUID."""
+    return TrafficRecord(
+        **data,
+        data_source=source,
+        timestamp=now,
+        record_uuid=_new_uuid(),
+    )
+
+
+def _record_to_out(record: TrafficRecord) -> dict:
+    """Build a consistent API dict with IST timestamps."""
+    uid = record.record_uuid
+    if not uid:
+        uid = _new_uuid()
+    return {
+        "id": record.id,
+        "record_uuid": uid,
+        "location": record.location,
+        "latitude": record.latitude,
+        "longitude": record.longitude,
+        "vehicle_count": record.vehicle_count,
+        "average_speed": record.average_speed,
+        "congestion_level": record.congestion_level,
+        "road_type": record.road_type,
+        "data_source": record.data_source or "manual",
+        "timestamp": _to_ist_iso(record.timestamp),
+        "created_at": _to_ist_iso(record.created_at),
+        "updated_at": _to_ist_iso(record.updated_at),
+    }
+
 
 # ─── Pydantic Schemas ──────────────────────────────────────────────────────────
 
-ALLOWED_CONGESTION = {"low", "medium", "high"}
-
 
 class TrafficRecordCreate(BaseModel):
-    location: str
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
-    vehicle_count: int
-    average_speed: Optional[float] = None
-    congestion_level: Optional[str] = None
-    road_type: Optional[str] = None
+    location: str = Field(..., min_length=2, max_length=255)
+    latitude: Optional[float] = Field(None, ge=-90, le=90)
+    longitude: Optional[float] = Field(None, ge=-180, le=180)
+    vehicle_count: Optional[int] = Field(None, ge=0, description="Auto-filled from live API when omitted")
+    average_speed: Optional[float] = Field(None, ge=0, le=200, description="km/h — auto-filled from live API when omitted")
+    congestion_level: Optional[str] = Field(None, description="low | medium | high — auto-derived when omitted")
+    road_type: Optional[str] = Field(None, description="arterial | highway | local | expressway | junction")
+
+    @field_validator("congestion_level")
+    @classmethod
+    def normalize_congestion(cls, v: str | None) -> str | None:
+        return _normalize_congestion_level(v)
 
     model_config = ConfigDict(json_schema_extra={
         "example": {
             "location": "Hitech City",
             "latitude": 17.4486,
             "longitude": 78.3908,
-            "vehicle_count": 245,
-            "average_speed": 32.5,
-            "congestion_level": "medium",
             "road_type": "arterial",
         }
     })
@@ -61,18 +185,12 @@ class TrafficRecordBulkCreate(BaseModel):
                     "location": "Hitech City",
                     "latitude": 17.4486,
                     "longitude": 78.3908,
-                    "vehicle_count": 245,
-                    "average_speed": 32.5,
-                    "congestion_level": "medium",
                     "road_type": "arterial",
                 },
                 {
                     "location": "Gachibowli",
                     "latitude": 17.4401,
                     "longitude": 78.3489,
-                    "vehicle_count": 110,
-                    "average_speed": 52.0,
-                    "congestion_level": "low",
                     "road_type": "arterial",
                 },
             ]
@@ -96,13 +214,38 @@ class PredictionRequest(BaseModel):
         return v
 
 
-class TrafficRecordOut(TrafficRecordCreate):
-    id: int = Field(..., description="Auto-generated record ID — use this in GET /traffic/records/{record_id}")
-    timestamp: datetime
-    created_at: datetime
+class TrafficRecordOut(BaseModel):
+    id: int
+    record_uuid: str = Field(..., description="Unique UUID — use GET /traffic/records/by-uuid/{record_uuid}")
+    location: str
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    vehicle_count: int
+    average_speed: Optional[float] = None
+    congestion_level: Optional[str] = None
+    road_type: Optional[str] = None
+    data_source: str = "manual"
+    timestamp: str = Field(..., description="Observation time (IST)")
+    created_at: str = Field(..., description="Record insert time (IST)")
+    updated_at: Optional[str] = Field(None, description="Last update time (IST)")
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
+
+
+class TrafficRecordResponse(BaseModel):
+    success: bool = True
+    data: TrafficRecordOut
+    timestamp: str = Field(..., description="API response time (IST)")
+
+
+class TrafficRecordBulkResponse(BaseModel):
+    success: bool = True
+    inserted: int
+    message: str
+    timestamp: str = Field(..., description="API response time (IST)")
+    record_uuids: List[str] = Field(..., description="UUID for each created record — preferred lookup key")
+    record_ids: List[int] = Field(..., description="Legacy integer IDs")
+    records: List[TrafficRecordOut]
 
 
 class PredictionOut(BaseModel):
@@ -179,57 +322,97 @@ def get_traffic_records(
     query = db.query(TrafficRecord).order_by(desc(TrafficRecord.timestamp))
     if location:
         query = query.filter(_location_filter_fn(TrafficRecord.location, location))
-    return query.limit(limit).all()
+    return [_record_to_out(r) for r in query.limit(limit).all()]
 
 
-@router.post("/records", response_model=TrafficRecordOut, status_code=201)
-def create_traffic_record(payload: TrafficRecordCreate, db: Session = Depends(get_db)):
-    """Save a new traffic observation to the database."""
-    record = TrafficRecord(**payload.model_dump())
+@router.post("/records", response_model=TrafficRecordResponse, status_code=201)
+async def create_traffic_record(
+    payload: TrafficRecordCreate,
+    live: bool = Query(
+        True,
+        description="When true and lat/lng are provided, fetches real speed from HERE/TomTom",
+    ),
+    db: Session = Depends(get_db),
+):
+    """
+    Save a traffic observation.
+
+    **Live mode (default):** send only `location`, `latitude`, `longitude`, and optional
+    `road_type` — speed, vehicle count, and congestion are fetched from HERE/TomTom.
+
+    **Manual mode:** set `live=false` and provide `vehicle_count`, `average_speed`,
+    and `congestion_level` yourself.
+    """
+    data, source = await _resolve_record_fields(payload.model_dump(), live=live)
+    now = datetime.now(timezone.utc)
+    record = _new_traffic_record(data, source, now)
     db.add(record)
     db.commit()
     db.refresh(record)
-    return record
+    return TrafficRecordResponse(
+        data=TrafficRecordOut(**_record_to_out(record)),
+        timestamp=_to_ist_iso(datetime.now(timezone.utc)),
+    )
 
 
-@router.post("/records/bulk", status_code=201)
-def create_traffic_records_bulk(
+@router.post("/records/bulk", response_model=TrafficRecordBulkResponse, status_code=201)
+async def create_traffic_records_bulk(
     payload: TrafficRecordBulkCreate,
+    live: bool = Query(True, description="Fetch live metrics for each record with coordinates"),
     db: Session = Depends(get_db),
-) -> dict:
-    """Insert up to 50 traffic observations in a single request.
-
-    Each created record's `id` is returned in the `record_ids` list so you can
-    immediately use them with `GET /api/v1/traffic/records/{record_id}`.
+):
     """
-    records = [TrafficRecord(**r.model_dump()) for r in payload.records]
+    Insert up to 50 traffic observations in a single request.
+
+    Each created record receives a unique `record_uuid`. Use
+    `GET /api/v1/traffic/records/by-uuid/{record_uuid}` to fetch a record by UUID.
+    """
+    now = datetime.now(timezone.utc)
+    # External flow lookups are independent. Running them sequentially made a
+    # 50-record batch take up to 50 network timeout windows.
+    semaphore = asyncio.Semaphore(8)
+
+    async def _resolve(item: TrafficRecordCreate) -> tuple[dict, str]:
+        async with semaphore:
+            return await _resolve_record_fields(item.model_dump(), live=live)
+
+    resolved = await asyncio.gather(*[_resolve(item) for item in payload.records])
+    records = [_new_traffic_record(data, source, now) for data, source in resolved]
     db.add_all(records)
     db.commit()
     for r in records:
         db.refresh(r)
-    return {
-        "inserted": len(records),
-        "message": f"{len(records)} records saved",
-        "record_ids": [r.id for r in records],
-        "records": [
-            {
-                "id": r.id,
-                "location": r.location,
-                "congestion_level": r.congestion_level,
-                "average_speed": r.average_speed,
-                "vehicle_count": r.vehicle_count,
-                "created_at": r.created_at.isoformat() if r.created_at else None,
-            }
-            for r in records
-        ],
-    }
+    out = [_record_to_out(r) for r in records]
+    return TrafficRecordBulkResponse(
+        inserted=len(records),
+        message=f"{len(records)} records saved",
+        timestamp=_to_ist_iso(datetime.now(timezone.utc)),
+        record_uuids=[r["record_uuid"] for r in out],
+        record_ids=[r["id"] for r in out],
+        records=[TrafficRecordOut(**r) for r in out],
+    )
+
+
+@router.get("/records/by-uuid/{record_uuid}", response_model=TrafficRecordOut)
+def get_record_by_uuid(
+    record_uuid: str = Path(
+        ...,
+        description="Record UUID from POST /traffic/records or /traffic/records/bulk",
+    ),
+    db: Session = Depends(get_db),
+):
+    """Fetch a single traffic record by its UUID."""
+    record = db.query(TrafficRecord).filter(TrafficRecord.record_uuid == record_uuid).first()
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Traffic record not found: {record_uuid}")
+    return _record_to_out(record)
 
 
 @router.get("/records/{record_id}", response_model=TrafficRecordOut)
 def get_record(
     record_id: int = Path(
         ...,
-        description="Traffic record ID — get this from `GET /api/v1/traffic/records` (copy any `id` from the response)",
+        description="Integer record ID — prefer `record_uuid` via GET /traffic/records/by-uuid/{record_uuid}",
         openapi_examples={"default": {"value": 1}},
     ),
     db: Session = Depends(get_db),
@@ -237,7 +420,7 @@ def get_record(
     record = db.query(TrafficRecord).filter(TrafficRecord.id == record_id).first()
     if not record:
         raise HTTPException(status_code=404, detail="Traffic record not found")
-    return record
+    return _record_to_out(record)
 
 
 # ─── Predictions ───────────────────────────────────────────────────────────────
@@ -407,6 +590,8 @@ def _auto_seed_incidents(location: str, db: Session) -> None:
 def get_incidents(
     active_only: bool = Query(True),
     location: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500, description="Maximum incidents returned"),
+    offset: int = Query(0, ge=0, description="Rows to skip for pagination"),
     db: Session = Depends(get_db),
 ):
     """Get road incidents, optionally filtered.
@@ -419,14 +604,14 @@ def get_incidents(
         query = query.filter(Incident.is_active == True)
     if location:
         query = query.filter(_location_filter_fn(Incident.location, location))
-    results = query.order_by(desc(Incident.reported_at)).all()
+    results = query.order_by(desc(Incident.reported_at)).offset(offset).limit(limit).all()
 
     if location:
         city_key = next((k for k in _INCIDENT_SEEDS if k in location.lower()), None)
         expected = len(_INCIDENT_SEEDS[city_key]) if city_key else 0
         if expected > 0 and len(results) < expected:
             _auto_seed_incidents(location, db)
-            results = query.order_by(desc(Incident.reported_at)).all()
+            results = query.order_by(desc(Incident.reported_at)).offset(offset).limit(limit).all()
 
     return [_incident_out(i) for i in results]
 
@@ -776,28 +961,25 @@ def get_summary(db: Session = Depends(get_db)):
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     last_24h = now - timedelta(hours=24)
 
-    # ── Traffic records ──────────────────────────────────────────────────────
-    total_records = db.query(func.count(TrafficRecord.id)).scalar() or 0
-    records_today = db.query(func.count(TrafficRecord.id)).filter(TrafficRecord.created_at >= today_start).scalar() or 0
-    records_24h   = db.query(func.count(TrafficRecord.id)).filter(TrafficRecord.created_at >= last_24h).scalar() or 0
-
-    congestion_counts = {}
-    for level in ("low", "medium", "high"):
-        congestion_counts[level] = (
-            db.query(func.count(TrafficRecord.id))
-            .filter(TrafficRecord.congestion_level == level)
-            .scalar() or 0
-        )
-
-    locations_tracked = (
-        db.query(func.count(func.distinct(TrafficRecord.location))).scalar() or 0
-    )
-
-    latest_record = db.query(func.max(TrafficRecord.created_at)).scalar()
-    avg_speed = db.query(func.avg(TrafficRecord.average_speed)).filter(
-        TrafficRecord.created_at >= last_24h,
-        TrafficRecord.average_speed.isnot(None),
-    ).scalar()
+    # Compute each table's counters in one scan. The previous implementation
+    # issued 15 separate aggregate queries and saturated the DB pool when
+    # Swagger/dashboard loaded Traffic endpoints concurrently.
+    traffic_stats = db.query(
+        func.count(TrafficRecord.id).label("total"),
+        func.sum(case((TrafficRecord.created_at >= today_start, 1), else_=0)).label("today"),
+        func.sum(case((TrafficRecord.created_at >= last_24h, 1), else_=0)).label("last_24h"),
+        func.count(func.distinct(TrafficRecord.location)).label("locations"),
+        func.max(TrafficRecord.created_at).label("latest"),
+        func.avg(
+            case(
+                (TrafficRecord.created_at >= last_24h, TrafficRecord.average_speed),
+                else_=None,
+            )
+        ).label("avg_speed_24h"),
+        func.sum(case((TrafficRecord.congestion_level == "low", 1), else_=0)).label("low"),
+        func.sum(case((TrafficRecord.congestion_level == "medium", 1), else_=0)).label("medium"),
+        func.sum(case((TrafficRecord.congestion_level == "high", 1), else_=0)).label("high"),
+    ).one()
 
     # Top 3 most congested locations (last 24 h)
     high_24h = (
@@ -809,47 +991,52 @@ def get_summary(db: Session = Depends(get_db)):
         .all()
     )
 
-    # ── Predictions ──────────────────────────────────────────────────────────
-    total_predictions  = db.query(func.count(PredictionResult.id)).scalar() or 0
-    active_predictions = db.query(func.count(PredictionResult.id)).filter(PredictionResult.is_active == True).scalar() or 0
-
-    # ── Incidents ────────────────────────────────────────────────────────────
-    total_incidents  = db.query(func.count(Incident.id)).scalar() or 0
-    active_incidents = db.query(func.count(Incident.id)).filter(Incident.is_active == True).scalar() or 0
-    resolved_incidents = total_incidents - active_incidents
-
-    severity_counts = {}
-    for sev in ("minor", "moderate", "severe"):
-        severity_counts[sev] = (
-            db.query(func.count(Incident.id))
-            .filter(Incident.severity == sev, Incident.is_active == True)
-            .scalar() or 0
-        )
+    prediction_stats = db.query(
+        func.count(PredictionResult.id).label("total"),
+        func.sum(case((PredictionResult.is_active.is_(True), 1), else_=0)).label("active"),
+    ).one()
+    incident_stats = db.query(
+        func.count(Incident.id).label("total"),
+        func.sum(case((Incident.is_active.is_(True), 1), else_=0)).label("active"),
+        func.sum(case(((Incident.is_active.is_(True)) & (Incident.severity == "minor"), 1), else_=0)).label("minor"),
+        func.sum(case(((Incident.is_active.is_(True)) & (Incident.severity == "moderate"), 1), else_=0)).label("moderate"),
+        func.sum(case(((Incident.is_active.is_(True)) & (Incident.severity == "severe"), 1), else_=0)).label("severe"),
+    ).one()
+    total_incidents = int(incident_stats.total or 0)
+    active_incidents = int(incident_stats.active or 0)
 
     return {
         "generated_at": now.isoformat(),
         "traffic_records": {
-            "total": total_records,
-            "added_today": records_today,
-            "added_last_24h": records_24h,
-            "locations_tracked": locations_tracked,
-            "average_speed_kmh_24h": round(avg_speed, 1) if avg_speed else None,
-            "last_record_at": latest_record.isoformat() if latest_record else None,
-            "congestion_breakdown": congestion_counts,
+            "total": int(traffic_stats.total or 0),
+            "added_today": int(traffic_stats.today or 0),
+            "added_last_24h": int(traffic_stats.last_24h or 0),
+            "locations_tracked": int(traffic_stats.locations or 0),
+            "average_speed_kmh_24h": round(float(traffic_stats.avg_speed_24h), 1) if traffic_stats.avg_speed_24h else None,
+            "last_record_at": traffic_stats.latest.isoformat() if traffic_stats.latest else None,
+            "congestion_breakdown": {
+                "low": int(traffic_stats.low or 0),
+                "medium": int(traffic_stats.medium or 0),
+                "high": int(traffic_stats.high or 0),
+            },
             "top_congested_locations_24h": [
                 {"location": loc, "high_congestion_records": cnt}
                 for loc, cnt in high_24h
             ],
         },
         "predictions": {
-            "total": total_predictions,
-            "active": active_predictions,
+            "total": int(prediction_stats.total or 0),
+            "active": int(prediction_stats.active or 0),
         },
         "incidents": {
             "total": total_incidents,
             "active": active_incidents,
-            "resolved": resolved_incidents,
-            "active_by_severity": severity_counts,
+            "resolved": total_incidents - active_incidents,
+            "active_by_severity": {
+                "minor": int(incident_stats.minor or 0),
+                "moderate": int(incident_stats.moderate or 0),
+                "severe": int(incident_stats.severe or 0),
+            },
         },
     }
 
@@ -871,31 +1058,47 @@ def get_traffic_leaderboard(
     Aggregates the last N hours of traffic records per location and scores
     each by congestion level + vehicle count. Useful for dashboards and alerts.
     """
-    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    now = datetime.now(timezone.utc)
+    actual_hours = hours
 
-    rows = (
-        db.query(
-            TrafficRecord.location,
-            func.avg(TrafficRecord.vehicle_count).label("avg_vehicles"),
-            func.avg(TrafficRecord.average_speed).label("avg_speed"),
-            func.count(TrafficRecord.id).label("record_count"),
+    def _query(window_hours: int):
+        since = now - timedelta(hours=window_hours)
+        return (
+            db.query(
+                TrafficRecord.location,
+                func.avg(TrafficRecord.vehicle_count).label("avg_vehicles"),
+                func.avg(TrafficRecord.average_speed).label("avg_speed"),
+                func.max(TrafficRecord.average_speed).label("free_flow_speed"),
+                func.count(TrafficRecord.id).label("record_count"),
+            )
+            .filter(
+                TrafficRecord.timestamp >= since,
+                TrafficRecord.location.isnot(None),
+            )
+            .group_by(TrafficRecord.location)
+            .all()
         )
-        .filter(TrafficRecord.timestamp >= since)
-        .group_by(TrafficRecord.location)
-        .all()
-    )
+
+    rows = _query(hours)
+    # A collector may not have completed its first cycle when the dashboard
+    # opens. Use recent stored observations instead of returning an empty table.
+    if not rows and hours < 6:
+        actual_hours = 6
+        rows = _query(actual_hours)
 
     results = []
     for row in rows:
         avg_v = float(row.avg_vehicles or 0)
         avg_s = float(row.avg_speed) if row.avg_speed else None
-        level = classify_congestion(int(avg_v), avg_s)
+        free_s = float(row.free_flow_speed) if row.free_flow_speed else None
+        level = classify_by_count_speed(int(avg_v), avg_s)
         results.append({
             "location": row.location,
             "congestion_level": level,
             "congestion_score": _CONGESTION_SCORE.get(level, 1),
             "avg_vehicle_count": round(avg_v, 1),
             "avg_speed_kmh": round(avg_s, 1) if avg_s else None,
+            "free_flow_speed_kmh": round(max(free_s or 0, avg_s or 0), 1) if (free_s or avg_s) else None,
             "record_count": row.record_count,
         })
 
@@ -904,10 +1107,13 @@ def get_traffic_leaderboard(
 
     return {
         "order": order,
-        "period_hours": hours,
+        "requested_period_hours": hours,
+        "period_hours": actual_hours,
+        "used_fallback_window": actual_hours != hours,
+        "has_data": bool(results),
         "total_locations_observed": len(results),
         "leaderboard": results[:top],
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": now.astimezone(_IST).isoformat(),
     }
 
 
@@ -1079,7 +1285,7 @@ def get_data_sources() -> dict:
         "note": (
             "Data is coming from real live traffic APIs."
             if active_source != "simulation"
-            else "No real API keys configured — using physics-based simulation. "
+            else "No real API keys configured — collector skips locations (REAL_DATA_ONLY=true). "
                  "Add HERE_API_KEY to .env for free live traffic data."
         ),
         "sources": {
@@ -1143,9 +1349,29 @@ def get_incident_stats(
     now_ist = datetime.now(_IST)
     since = now_ist - timedelta(days=days)
 
-    incidents = db.query(Incident).filter(Incident.reported_at >= since).all()
+    base_filter = Incident.reported_at >= since
+    totals = (
+        db.query(
+            func.count(Incident.id).label("total"),
+            func.sum(case((Incident.is_active.is_(True), 1), else_=0)).label("active"),
+            func.sum(case((Incident.is_active.is_(False), 1), else_=0)).label("resolved"),
+            func.avg(
+                case(
+                    (
+                        (Incident.is_active.is_(False))
+                        & Incident.resolved_at.isnot(None),
+                        func.extract("epoch", Incident.resolved_at - Incident.reported_at),
+                    ),
+                    else_=None,
+                )
+            ).label("avg_resolution_seconds"),
+        )
+        .filter(base_filter)
+        .one()
+    )
 
-    if not incidents:
+    total = int(totals.total or 0)
+    if total == 0:
         return {
             "period_days": days,
             "period_start": since.isoformat(),
@@ -1154,58 +1380,55 @@ def get_incident_stats(
             "message": "No incidents recorded in this period",
         }
 
-    active   = [i for i in incidents if i.is_active]
-    resolved = [i for i in incidents if not i.is_active and i.resolved_at and i.reported_at]
-
-    # Resolution time — normalise both sides to UTC before subtracting
-    avg_resolution_minutes = None
-    avg_resolution_hours   = None
-    if resolved:
-        durations = []
-        for i in resolved:
-            try:
-                res = i.resolved_at if i.resolved_at.tzinfo else i.resolved_at.replace(tzinfo=timezone.utc)
-                rep = i.reported_at if i.reported_at.tzinfo else i.reported_at.replace(tzinfo=timezone.utc)
-                secs = (res - rep).total_seconds()
-                if secs > 0:
-                    durations.append(secs)
-            except Exception:
-                pass
-        if durations:
-            avg_secs = sum(durations) / len(durations)
-            avg_resolution_minutes = round(avg_secs / 60, 1)
-            avg_resolution_hours   = round(avg_secs / 3600, 2)
-
-    by_type     = Counter(i.incident_type for i in incidents)
-    by_severity = Counter(i.severity or "unspecified" for i in incidents)
-    by_location = Counter(i.location for i in incidents)
-
-    # Active vs resolved breakdown per type
-    active_by_type   = Counter(i.incident_type for i in active)
-    resolved_by_type = Counter(i.incident_type for i in resolved)
-
-    # Daily counts in IST date
-    daily_counts: Counter = Counter()
-    for i in incidents:
-        if i.reported_at:
-            rep_ist = i.reported_at.astimezone(_IST) if i.reported_at.tzinfo else i.reported_at
-            daily_counts[rep_ist.strftime("%Y-%m-%d")] += 1
-        else:
-            daily_counts["unknown"] += 1
+    type_rows = (
+        db.query(
+            Incident.incident_type,
+            func.count(Incident.id).label("total"),
+            func.sum(case((Incident.is_active.is_(True), 1), else_=0)).label("active"),
+            func.sum(case((Incident.is_active.is_(False), 1), else_=0)).label("resolved"),
+        )
+        .filter(base_filter)
+        .group_by(Incident.incident_type)
+        .all()
+    )
+    severity_rows = (
+        db.query(func.coalesce(Incident.severity, "unspecified"), func.count(Incident.id))
+        .filter(base_filter)
+        .group_by(func.coalesce(Incident.severity, "unspecified"))
+        .order_by(func.count(Incident.id).desc())
+        .all()
+    )
+    location_rows = (
+        db.query(Incident.location, func.count(Incident.id).label("count"))
+        .filter(base_filter)
+        .group_by(Incident.location)
+        .order_by(desc("count"))
+        .limit(5)
+        .all()
+    )
+    ist_day = func.date(func.timezone("Asia/Kolkata", Incident.reported_at))
+    day_rows = (
+        db.query(ist_day.label("day"), func.count(Incident.id))
+        .filter(base_filter)
+        .group_by(ist_day)
+        .order_by(ist_day)
+        .all()
+    )
+    avg_secs = float(totals.avg_resolution_seconds) if totals.avg_resolution_seconds else None
 
     return {
         "period_days": days,
         "period_start": since.isoformat(),
         "period_end": now_ist.isoformat(),
-        "total_incidents": len(incidents),
-        "active_incidents": len(active),
-        "resolved_incidents": len(resolved),
-        "avg_resolution_minutes": avg_resolution_minutes,
-        "avg_resolution_hours": avg_resolution_hours,
-        "by_type": dict(by_type.most_common()),
-        "active_by_type": dict(active_by_type.most_common()),
-        "resolved_by_type": dict(resolved_by_type.most_common()),
-        "by_severity": dict(by_severity.most_common()),
-        "top_5_hotspot_locations": dict(by_location.most_common(5)),
-        "daily_counts": dict(sorted(daily_counts.items())),
+        "total_incidents": total,
+        "active_incidents": int(totals.active or 0),
+        "resolved_incidents": int(totals.resolved or 0),
+        "avg_resolution_minutes": round(avg_secs / 60, 1) if avg_secs else None,
+        "avg_resolution_hours": round(avg_secs / 3600, 2) if avg_secs else None,
+        "by_type": {row.incident_type: int(row.total) for row in type_rows},
+        "active_by_type": {row.incident_type: int(row.active or 0) for row in type_rows},
+        "resolved_by_type": {row.incident_type: int(row.resolved or 0) for row in type_rows},
+        "by_severity": {str(severity): int(count) for severity, count in severity_rows},
+        "top_5_hotspot_locations": {location: int(count) for location, count in location_rows},
+        "daily_counts": {day.isoformat(): int(count) for day, count in day_rows},
     }

@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 
 from app.database import SessionLocal
 from app.models.predictor import TrafficRecord
+from app.services.traffic_flow_service import REAL_DATA_ONLY
 from app.services.india_districts import INDIA_DISTRICTS
 from app.services.google_traffic_service import fetch_district_traffic
 
@@ -24,7 +25,9 @@ logger = logging.getLogger(__name__)
 
 _BATCH_SIZE   = 40          # districts per cycle
 _INTERVAL_SEC = 1800        # 30 minutes between cycles
-_CALL_DELAY   = 0.5         # seconds between API calls (avoid burst)
+_PARALLEL     = 6           # concurrent Google/live lookups
+_STARTUP_DELAY = 90         # keep API snappy at boot
+_CALL_DELAY   = 0.0         # unused when parallel
 
 # Shared in-memory state: latest reading per district (for WS snapshots)
 _district_cache: dict[str, dict] = {}
@@ -128,13 +131,27 @@ async def collect_district_batch() -> None:
     db = SessionLocal()
     records = []
     try:
-        for district in batch:
-            flow = await fetch_district_traffic(
-                district["lat"], district["lng"],
-                district["dest_lat"], district["dest_lng"],
-            )
+        sem = asyncio.Semaphore(_PARALLEL)
+
+        async def _one(district: dict):
+            async with sem:
+                flow = await fetch_district_traffic(
+                    district["lat"], district["lng"],
+                    district["dest_lat"], district["dest_lng"],
+                )
+            return district, flow
+
+        fetched = await asyncio.gather(*[_one(d) for d in batch])
+
+        for district, flow in fetched:
             source = "google"
             if flow is None:
+                if REAL_DATA_ONLY:
+                    logger.debug(
+                        "Skipping district %s — no live API data",
+                        district["district"],
+                    )
+                    continue
                 flow = _simulate_district(district["lat"], district["lng"])
                 source = "simulated"
             else:
@@ -158,7 +175,6 @@ async def collect_district_batch() -> None:
             }
             _district_cache[district["district"]] = entry
 
-            # Broadcast individual update to district WS clients
             if _broadcast_fn is not None:
                 try:
                     await _broadcast_fn({
@@ -176,12 +192,10 @@ async def collect_district_batch() -> None:
                 average_speed    = speed,
                 congestion_level = congestion,
                 road_type        = "district",
+                data_source      = source,
                 timestamp        = now,
                 created_at       = now,
             ))
-
-            if _CALL_DELAY > 0:
-                await asyncio.sleep(_CALL_DELAY)
 
         db.bulk_save_objects(records)
         db.commit()
@@ -195,11 +209,12 @@ async def collect_district_batch() -> None:
 
 
 async def run_district_collector() -> None:
-    """Infinite loop: collect first batch immediately, then every 30 min."""
+    """Infinite loop: delay briefly so API is ready, then collect every 30 min."""
     logger.info(
         "India district traffic collector started (%d districts, batch=%d)",
         len(INDIA_DISTRICTS), _BATCH_SIZE,
     )
+    await asyncio.sleep(_STARTUP_DELAY)
     while True:
         await collect_district_batch()
         await asyncio.sleep(_INTERVAL_SEC)

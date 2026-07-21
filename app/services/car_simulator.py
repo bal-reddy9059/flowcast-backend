@@ -40,36 +40,55 @@ class CarSimulator:
     # ── Initialization ────────────────────────────────────────────────────────
 
     def initialize_from_locations(self) -> None:
+        from sqlalchemy import text
+
         from app.database import SessionLocal
-        from app.models.predictor import TrafficRecord
         from app.services.india_locations import INDIA_LOCATIONS
         from app.services.realtime_collector import _simulate_flow
 
+        by_name: dict[str, dict] = {}
         db = SessionLocal()
         try:
-            location_data: list[tuple[dict, float, float, str]] = []
-            for loc in INDIA_LOCATIONS:
-                record = (
-                    db.query(TrafficRecord)
-                    .filter(TrafficRecord.location == loc["name"])
-                    .order_by(TrafficRecord.created_at.desc())
-                    .first()
+            db.execute(text("SET LOCAL statement_timeout = '800ms'"))
+            db.execute(text("SET LOCAL lock_timeout = '300ms'"))
+            # One query for all locations — avoids N locked round-trips
+            rows = db.execute(
+                text(
+                    """
+                    SELECT DISTINCT ON (location)
+                           location, vehicle_count, average_speed, congestion_level
+                    FROM traffic_records
+                    WHERE created_at > NOW() - INTERVAL '12 hours'
+                    ORDER BY location, created_at DESC
+                    """
                 )
-                if record and record.vehicle_count:
-                    vehicle_count = float(record.vehicle_count)
-                    speed = float(record.average_speed or 35)
-                    congestion = record.congestion_level or "medium"
-                else:
-                    flow = _simulate_flow(loc["lat"], loc["lng"])
-                    cur_speed = float(flow.get("currentSpeed", 35))
-                    free_speed = float(flow.get("freeFlowSpeed", 60))
-                    ratio = cur_speed / max(free_speed, 1)
-                    vehicle_count = float(max(50, int((1 - ratio) * 2000 + random.uniform(-100, 100))))
-                    speed = cur_speed
-                    congestion = "high" if ratio < 0.5 else ("medium" if ratio < 0.75 else "low")
-                location_data.append((loc, vehicle_count, speed, congestion))
+            ).mappings().all()
+            by_name = {r["location"]: dict(r) for r in rows}
+        except Exception as exc:
+            logger.warning("Car simulator DB seed skipped (%s) — using simulated speeds", type(exc).__name__)
+            try:
+                db.rollback()
+            except Exception:
+                pass
         finally:
             db.close()
+
+        location_data: list[tuple[dict, float, float, str]] = []
+        for loc in INDIA_LOCATIONS:
+            record = by_name.get(loc["name"])
+            if record and record.get("vehicle_count"):
+                vehicle_count = float(record["vehicle_count"] or 50)
+                speed = float(record.get("average_speed") or 35)
+                congestion = record.get("congestion_level") or "medium"
+            else:
+                flow = _simulate_flow(loc["lat"], loc["lng"])
+                cur_speed = float(flow.get("currentSpeed", 35))
+                free_speed = float(flow.get("freeFlowSpeed", 60))
+                ratio = cur_speed / max(free_speed, 1)
+                vehicle_count = float(max(50, int((1 - ratio) * 2000 + random.uniform(-100, 100))))
+                speed = cur_speed
+                congestion = "high" if ratio < 0.5 else ("medium" if ratio < 0.75 else "low")
+            location_data.append((loc, vehicle_count, speed, congestion))
 
         total_vehicles = sum(d[1] for d in location_data) or 1.0
         cars: list[SimulatedCar] = []
@@ -130,34 +149,50 @@ class CarSimulator:
     # ── DB refresh (every 30 min) ─────────────────────────────────────────────
 
     def refresh_from_db(self) -> None:
+        from sqlalchemy import text
+
         from app.database import SessionLocal
-        from app.models.predictor import TrafficRecord
+
+        if not self._cars:
+            return
 
         db = SessionLocal()
         try:
-            # Build location → (speed, congestion) map from latest DB records
-            location_map: dict[str, tuple[float, str]] = {}
-            for car in self._cars.values():
-                if car.location in location_map:
-                    continue
-                record = (
-                    db.query(TrafficRecord)
-                    .filter(TrafficRecord.location == car.location)
-                    .order_by(TrafficRecord.created_at.desc())
-                    .first()
+            db.execute(text("SET LOCAL statement_timeout = '800ms'"))
+            db.execute(text("SET LOCAL lock_timeout = '300ms'"))
+            names = list({c.location for c in self._cars.values()})
+            rows = db.execute(
+                text(
+                    """
+                    SELECT DISTINCT ON (location)
+                           location, average_speed, congestion_level
+                    FROM traffic_records
+                    WHERE location = ANY(:names)
+                      AND created_at > NOW() - INTERVAL '12 hours'
+                    ORDER BY location, created_at DESC
+                    """
+                ),
+                {"names": names},
+            ).mappings().all()
+            location_map = {
+                r["location"]: (
+                    float(r["average_speed"] or 35),
+                    r["congestion_level"] or "medium",
                 )
-                if record and record.average_speed:
-                    location_map[car.location] = (
-                        float(record.average_speed),
-                        record.congestion_level or "medium",
-                    )
+                for r in rows
+                if r.get("average_speed")
+            }
             for car in self._cars.values():
                 if car.location in location_map:
                     new_speed, new_congestion = location_map[car.location]
                     car.speed_kmh = max(1.0, new_speed + random.uniform(-5, 5))
                     car.congestion_level = new_congestion
         except Exception as exc:
-            logger.warning("CarSimulator DB refresh failed: %s", exc)
+            logger.warning("CarSimulator DB refresh skipped: %s", type(exc).__name__)
+            try:
+                db.rollback()
+            except Exception:
+                pass
         finally:
             db.close()
 
