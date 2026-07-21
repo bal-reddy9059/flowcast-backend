@@ -1,5 +1,5 @@
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import create_engine, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -11,10 +11,18 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:bala2808@localho
 
 engine = create_engine(
     DATABASE_URL,
-    pool_pre_ping=True,       # Checks connection health before using
-    pool_size=10,             # Number of connections to keep
-    max_overflow=20,          # Extra connections allowed beyond pool_size
-    echo=False                # Set True to log all SQL queries
+    pool_pre_ping=True,
+    pool_size=5,
+    max_overflow=10,
+    # Fail before the 3.5 s HTTP deadline instead of leaving cancelled request
+    # threads queued behind a saturated pool.
+    pool_timeout=0.5,
+    # Fail fast on locked tables — never freeze the asyncio event loop waiting on ALTER
+    connect_args={
+        "connect_timeout": 1,
+        "options": "-c lock_timeout=500 -c statement_timeout=2500",
+    },
+    echo=False,
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -23,11 +31,15 @@ Base = declarative_base()
 
 
 def get_db():
-    """Dependency that provides a DB session and ensures it's closed after use."""
+    """Dependency that provides a DB session and ensures locks are released."""
     db = SessionLocal()
     try:
         yield db
     finally:
+        try:
+            db.rollback()  # end open txn so we never leave idle-in-transaction
+        except Exception:
+            pass
         db.close()
 
 
@@ -232,13 +244,13 @@ def seed_admin_user() -> None:
             existing = db.query(User).filter(User.email == admin_email).first()
             if existing:
                 existing.is_admin   = True
-                existing.last_login = existing.last_login or datetime.utcnow()
+                existing.last_login = existing.last_login or datetime.now(timezone.utc).replace(tzinfo=None)
                 db.commit()
                 print(f"[OK] Promoted existing user to admin → {admin_email}")
                 return
 
             # Create a fresh admin account
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
             admin = User(
                 full_name       = "FlowCast Admin",
                 email           = admin_email,
@@ -256,31 +268,187 @@ def seed_admin_user() -> None:
         print(f"[WARN] Admin seed failed: {exc}")
 
 
-def run_column_migrations():
-    """Add UUID columns to existing tables and backfill NULLs.
+def cleanup_stale_db_backends(max_idle_seconds: int = 30) -> int:
+    """Terminate backends that wedge traffic_records (idle-in-transaction / stuck ALTER).
 
-    Safe to run on every startup — ADD COLUMN IF NOT EXISTS is a no-op
-    when the column already exists.
+    Multiple reloads used to queue AccessExclusiveLock ALTERs behind abandoned
+    sessions, freezing every traffic query. Safe: only targets this database and
+    never the current connection.
     """
-    migrations = [
+    killed = 0
+    try:
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT pid, state, left(query, 80) AS q
+                    FROM pg_stat_activity
+                    WHERE datname = current_database()
+                      AND pid <> pg_backend_pid()
+                      AND (
+                        (state LIKE 'idle in transaction%'
+                         AND xact_start < NOW() - (:idle * INTERVAL '1 second'))
+                        OR (wait_event_type = 'Lock'
+                            AND query ILIKE '%ALTER TABLE traffic_records%'
+                            AND query_start < NOW() - INTERVAL '5 seconds')
+                        OR (wait_event_type = 'Lock'
+                            AND query ILIKE '%CREATE INDEX%traffic_records%'
+                            AND query_start < NOW() - INTERVAL '5 seconds')
+                      )
+                    """
+                ),
+                {"idle": max_idle_seconds},
+            ).fetchall()
+            for row in rows:
+                try:
+                    ok = conn.execute(
+                        text("SELECT pg_terminate_backend(:pid)"),
+                        {"pid": row.pid},
+                    ).scalar()
+                    if ok:
+                        killed += 1
+                        print(f"[OK] Terminated stale backend pid={row.pid} state={row.state}")
+                except Exception as exc:
+                    print(f"[WARN] Could not terminate pid={row.pid}: {type(exc).__name__}")
+        if killed:
+            print(f"[OK] Cleared {killed} stale DB session(s)")
+    except Exception as exc:
+        print(f"[WARN] Stale-backend cleanup skipped: {type(exc).__name__}")
+    return killed
+
+
+def run_column_migrations():
+    """Add missing columns only. Skip ALTER when the column already exists.
+
+    PostgreSQL takes AccessExclusiveLock even for ADD COLUMN IF NOT EXISTS,
+    which used to freeze HTTP while traffic_records was locked.
+    Index creation is deferred — never run at boot on a live table.
+    """
+    all_columns = [
         ("traffic_records",    "record_uuid",    "VARCHAR(36)"),
+        ("traffic_records",    "data_source",    "VARCHAR(20) DEFAULT 'manual'"),
         ("prediction_results", "prediction_uuid", "VARCHAR(36)"),
         ("incidents",          "incident_uuid",   "VARCHAR(36)"),
-        # Google OAuth columns on users
         ("users", "auth_provider", "VARCHAR(20) DEFAULT 'local' NOT NULL"),
         ("users", "google_id",     "VARCHAR(255)"),
         ("users", "picture_url",   "VARCHAR(500)"),
+        ("incidents", "reported_by", "VARCHAR(36)"),
+        ("incidents", "upvotes",     "INTEGER DEFAULT 0 NOT NULL"),
+        ("incidents", "downvotes",   "INTEGER DEFAULT 0 NOT NULL"),
+        ("incidents", "expires_at",  "TIMESTAMPTZ"),
+        ("webhooks",  "name",        "VARCHAR(200)"),
+    ]
+    try:
+        cleanup_stale_db_backends(max_idle_seconds=20)
+
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            conn.execute(text("SET lock_timeout = '1500ms'"))
+            conn.execute(text("SET statement_timeout = '5000ms'"))
+            for table, col, dtype in all_columns:
+                exists = conn.execute(text(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = :t AND column_name = :c"
+                ), {"t": table, "c": col}).fetchone()
+                if exists:
+                    continue
+                try:
+                    conn.execute(text(
+                        f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {dtype}"
+                    ))
+                    print(f"[OK] Added {table}.{col}")
+                except Exception as col_exc:
+                    print(f"[WARN] Skip {table}.{col}: {type(col_exc).__name__}")
+        print("[OK] Column migrations finished")
+    except Exception as e:
+        print(f"[WARN] Column migration skipped: {e}")
+
+
+def ensure_traffic_indexes() -> None:
+    """Create query-critical indexes without blocking traffic writes."""
+    try:
+        cleanup_stale_db_backends(max_idle_seconds=20)
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            conn.execute(text("SET lock_timeout = '2s'"))
+            conn.execute(text("SET statement_timeout = '30s'"))
+            for ddl in (
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_traffic_records_location_created "
+                "ON traffic_records (location, created_at DESC)",
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_traffic_records_created_at "
+                "ON traffic_records (created_at DESC)",
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_traffic_records_timestamp "
+                "ON traffic_records (timestamp DESC)",
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_traffic_records_location_timestamp "
+                "ON traffic_records (location, timestamp DESC)",
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_incidents_active_reported "
+                "ON incidents (is_active, reported_at DESC)",
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_incidents_reported_at "
+                "ON incidents (reported_at DESC)",
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_incidents_active_expiry "
+                "ON incidents (expires_at) WHERE is_active = true AND expires_at IS NOT NULL",
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_incidents_created_at "
+                "ON incidents (created_at DESC)",
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_prediction_active_created "
+                "ON prediction_results (is_active, created_at DESC)",
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_zone_alerts_zone_triggered "
+                "ON zone_alerts (zone_id, triggered_at DESC)",
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_rule_evaluations_triggered "
+                "ON rule_evaluations (triggered_at DESC)",
+            ):
+                try:
+                    conn.execute(text(ddl))
+                    index_pos = ddl.split().index("EXISTS") + 1
+                    print(f"[OK] Index ready: {ddl.split()[index_pos]}")
+                except Exception as idx_exc:
+                    print(f"[WARN] Index create skipped: {type(idx_exc).__name__}")
+    except Exception as e:
+        print(f"[WARN] ensure_traffic_indexes skipped: {e}")
+
+
+def run_startup_migrations() -> None:
+    """All boot migrations in one worker thread — call before background monitors."""
+    cleanup_stale_db_backends(max_idle_seconds=15)
+    _run = (
+        migrate_users_id_to_uuid,
+        migrate_routes_id_to_uuid,
+        migrate_favorites_id_to_uuid,
+        migrate_notifications_id_to_uuid,
+        migrate_trips_id_to_uuid,
+        migrate_alerts_id_to_uuid,
+        run_column_migrations,
+    )
+    for fn in _run:
+        try:
+            fn()
+        except Exception as exc:
+            print(f"[WARN] {fn.__name__} failed: {type(exc).__name__}: {exc}")
+    # Indexes after columns — still best-effort, never blocks API
+    try:
+        ensure_traffic_indexes()
+    except Exception:
+        pass
+
+
+
+def backfill_uuid_columns(batch_size: int = 2000) -> None:
+    """Optional maintenance — backfill missing UUIDs in batches (not run on startup)."""
+    uuid_cols = [
+        ("traffic_records",    "record_uuid"),
+        ("prediction_results", "prediction_uuid"),
+        ("incidents",          "incident_uuid"),
     ]
     try:
         with engine.begin() as conn:
-            for table, col, dtype in migrations:
+            for table, col in uuid_cols:
+                needs = conn.execute(text(
+                    f"SELECT 1 FROM {table} WHERE {col} IS NULL LIMIT 1"
+                )).fetchone()
+                if not needs:
+                    continue
                 conn.execute(text(
-                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {dtype}"
+                    f"UPDATE {table} SET {col} = gen_random_uuid()::text "
+                    f"WHERE id IN ("
+                    f"  SELECT id FROM {table} WHERE {col} IS NULL LIMIT {batch_size}"
+                    f")"
                 ))
-            for table, col, _ in migrations:
-                conn.execute(text(
-                    f"UPDATE {table} SET {col} = gen_random_uuid()::text WHERE {col} IS NULL"
-                ))
-        print("[OK] Column migrations applied (UUID columns ready)")
     except Exception as e:
-        print(f"[WARN] Column migration skipped: {e}")
+        print(f"[WARN] UUID backfill skipped: {e}")

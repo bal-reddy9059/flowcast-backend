@@ -1,18 +1,18 @@
 """
 ETA calculation services for FlowCast.
 
-Provides real-time ETA calculations using stored traffic observations.
+Provides real-time ETA calculations using stored traffic observations,
+with live TomTom/HERE upgrade when available. Designed to respond in <1.5s.
 """
 
 import logging
-from datetime import datetime, timezone
-from typing import Any
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select, func
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.models.predictor import TrafficRecord
 from app.schemas.eta import ETAResponse
 from app.services.city_aliases import CITY_ALIASES as _CITY_ALIASES
 
@@ -56,88 +56,199 @@ def calculate_eta_minutes(distance_km: float, speed_kmh: float) -> tuple[float, 
     return round(eta_minutes, 1), round(eta_with_buffer_minutes, 1)
 
 
-def get_location_traffic(location: str, db: Session) -> tuple[Any, str, float]:
-    """Fetch the latest traffic record for a location and derive confidence.
+class _TrafficSnap:
+    __slots__ = ("average_speed", "vehicle_count", "congestion_level", "created_at")
 
-    For city names (e.g. 'Hyderabad'), aggregates across all known neighbourhoods.
-    Returns (record_or_aggregate, confidence, age_minutes).
-    """
-    from sqlalchemy import or_
+    def __init__(
+        self,
+        average_speed: float,
+        vehicle_count: int,
+        congestion_level: str,
+        created_at: datetime | None,
+    ) -> None:
+        self.average_speed = average_speed
+        self.vehicle_count = vehicle_count
+        self.congestion_level = congestion_level
+        self.created_at = created_at
 
-    now = datetime.now(_IST)
-    aliases = _CITY_ALIASES.get(location.lower())
 
-    if aliases:
-        # City-level: average across all neighbourhood records from last 2 hours
-        rows = (
-            db.query(
-                func.avg(TrafficRecord.average_speed).label("avg_speed"),
-                func.avg(TrafficRecord.vehicle_count).label("avg_vehicles"),
-                func.max(TrafficRecord.created_at).label("latest"),
-                func.count(TrafficRecord.id).label("cnt"),
-            )
-            .filter(
-                or_(*[TrafficRecord.location.ilike(f"%{a}%") for a in aliases]),
-                TrafficRecord.average_speed.isnot(None),
-            )
-            .first()
+def _age_minutes(created_at: datetime | None) -> float:
+    if created_at is None:
+        return 999.0
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    return (now - created_at.astimezone(timezone.utc)).total_seconds() / 60.0
+
+
+def _confidence_from_age(age_minutes: float) -> str:
+    if age_minutes < 15:
+        return "high"
+    if age_minutes < 60:
+        return "medium"
+    return "low"
+
+
+def _latest_record_for_name(db: Session, name: str) -> Any | None:
+    """Index-friendly lookup: exact match first, then prefix. No lower()/ilike scans."""
+    # Cap wait — never sit on a locked traffic_records table
+    db.execute(text("SET LOCAL statement_timeout = '800ms'"))
+    db.execute(text("SET LOCAL lock_timeout = '400ms'"))
+
+    row = db.execute(
+        text(
+            "SELECT average_speed, vehicle_count, congestion_level, created_at "
+            "FROM traffic_records WHERE location = :loc "
+            "ORDER BY created_at DESC LIMIT 1"
+        ),
+        {"loc": name},
+    ).mappings().first()
+    if row:
+        return _TrafficSnap(
+            float(row["average_speed"] or 0),
+            int(row["vehicle_count"] or 0),
+            row["congestion_level"] or "medium",
+            row["created_at"],
         )
 
-        if not rows or not rows.avg_speed:
-            logger.info("No city-level traffic data for %s", location)
+    # Case-insensitive exact via citext-free pattern: try title/upper variants quickly
+    row = db.execute(
+        text(
+            "SELECT average_speed, vehicle_count, congestion_level, created_at "
+            "FROM traffic_records WHERE location ILIKE :loc "
+            "ORDER BY created_at DESC LIMIT 1"
+        ),
+        {"loc": name},
+    ).mappings().first()
+    if row:
+        return _TrafficSnap(
+            float(row["average_speed"] or 0),
+            int(row["vehicle_count"] or 0),
+            row["congestion_level"] or "medium",
+            row["created_at"],
+        )
+
+    # Prefix only (uses btree index better than %name%)
+    row = db.execute(
+        text(
+            "SELECT average_speed, vehicle_count, congestion_level, created_at "
+            "FROM traffic_records WHERE location ILIKE :pfx "
+            "ORDER BY created_at DESC LIMIT 1"
+        ),
+        {"pfx": f"{name}%"},
+    ).mappings().first()
+    if row:
+        return _TrafficSnap(
+            float(row["average_speed"] or 0),
+            int(row["vehicle_count"] or 0),
+            row["congestion_level"] or "medium",
+            row["created_at"],
+        )
+    return None
+
+
+def get_location_traffic(location: str, db: Session) -> tuple[Any, str, float]:
+    """Fetch the latest traffic record for a location and derive confidence."""
+    aliases = _CITY_ALIASES.get(location.lower())
+
+    try:
+        if aliases:
+            db.execute(text("SET LOCAL statement_timeout = '800ms'"))
+            db.execute(text("SET LOCAL lock_timeout = '400ms'"))
+            # Limit to recent rows so aggregation stays cheap
+            rows = db.execute(
+                text(
+                    """
+                    SELECT AVG(average_speed) AS avg_speed,
+                           AVG(vehicle_count) AS avg_vehicles,
+                           MAX(created_at) AS latest
+                    FROM (
+                      SELECT average_speed, vehicle_count, created_at
+                      FROM traffic_records
+                      WHERE location = ANY(:names)
+                        AND average_speed IS NOT NULL
+                        AND created_at > NOW() - INTERVAL '6 hours'
+                      ORDER BY created_at DESC
+                      LIMIT 200
+                    ) recent
+                    """
+                ),
+                {"names": list(aliases)},
+            ).mappings().first()
+
+            if rows and rows["avg_speed"]:
+                avg_speed = float(rows["avg_speed"])
+                if avg_speed >= 50:
+                    congestion = "low"
+                elif avg_speed >= 25:
+                    congestion = "medium"
+                else:
+                    congestion = "high"
+                age = _age_minutes(rows["latest"])
+                return (
+                    _TrafficSnap(
+                        avg_speed,
+                        int(rows["avg_vehicles"] or 0),
+                        congestion,
+                        rows["latest"],
+                    ),
+                    _confidence_from_age(age),
+                    round(age, 1),
+                )
+
+        record = _latest_record_for_name(db, location.strip())
+        if not record:
+            logger.info("No traffic data for %s", location)
             return None, "low", 0.0
 
-        # Build a pseudo-record dict
-        latest = rows.latest
-        if latest and latest.tzinfo is None:
-            latest = latest.replace(tzinfo=timezone.utc)
-        age_minutes = (now.astimezone(timezone.utc) - latest.astimezone(timezone.utc)).total_seconds() / 60.0 if latest else 999.0
-
-        # Determine congestion from average speed
-        avg_speed = float(rows.avg_speed)
-        if avg_speed >= 50:
-            congestion = "low"
-        elif avg_speed >= 25:
-            congestion = "medium"
-        else:
-            congestion = "high"
-
-        class _Aggregate:
-            average_speed = avg_speed
-            vehicle_count = int(rows.avg_vehicles or 0)
-            congestion_level = congestion
-            created_at = latest
-
-        confidence = "high" if age_minutes < 15 else "medium" if age_minutes < 60 else "low"
-        logger.info("City ETA for %s: avg_speed=%.1f age=%.0f min confidence=%s", location, avg_speed, age_minutes, confidence)
-        return _Aggregate(), confidence, round(age_minutes, 1)
-
-    # Single location
-    stmt = (
-        select(TrafficRecord)
-        .where(TrafficRecord.location.ilike(f"%{location}%"))
-        .order_by(TrafficRecord.created_at.desc())
-        .limit(1)
-    )
-    result = db.execute(stmt)
-    record = result.scalars().first()
-
-    if not record:
-        logger.info("No traffic data for %s", location)
+        age = _age_minutes(record.created_at)
+        return record, _confidence_from_age(age), round(age, 1)
+    except Exception as exc:
+        # Locked / slow DB — caller falls back to defaults instantly
+        logger.warning("ETA DB lookup skipped for %s: %s", location, type(exc).__name__)
+        try:
+            db.rollback()
+        except Exception:
+            pass
         return None, "low", 0.0
 
-    created_at = record.created_at
-    age_minutes = 0.0
-    if created_at is None:
-        confidence = "low"
-    else:
-        if created_at.tzinfo is None:
-            created_at = created_at.replace(tzinfo=timezone.utc)
-        age_minutes = (now.astimezone(timezone.utc) - created_at.astimezone(timezone.utc)).total_seconds() / 60.0
-        confidence = "high" if age_minutes < 15 else "medium" if age_minutes < 60 else "low"
 
-    logger.debug("ETA record for %s age=%.1f min confidence=%s", location, age_minutes, confidence)
-    return record, confidence, round(age_minutes, 1)
+async def fetch_live_location_flow(location: str) -> Optional[dict]:
+    """
+    Look up a location by name in INDIA_LOCATIONS and fetch live traffic flow
+    via TomTom (preferred) / HERE — bypasses the DB cache for freshness.
+
+    Hard-capped at ~0.7s so request handlers stay snappy when APIs stall.
+    """
+    import asyncio
+
+    from app.services.india_locations import INDIA_LOCATIONS
+    from app.services.traffic_flow_service import fetch_flow
+    from app.services.tomtom_service import classify_congestion as _classify
+
+    loc = next(
+        (l for l in INDIA_LOCATIONS if l["name"].lower() == location.lower()),
+        None,
+    )
+    if not loc:
+        return None
+
+    try:
+        flow = await asyncio.wait_for(fetch_flow(loc["lat"], loc["lng"]), timeout=0.7)
+    except asyncio.TimeoutError:
+        logger.debug("Live flow timeout for %s", location)
+        return None
+
+    if flow is None:
+        return None
+
+    cur = float(flow.get("currentSpeed", 35))
+    free = float(flow.get("freeFlowSpeed", 60))
+    return {
+        "speed_kmh": cur,
+        "congestion_level": _classify(cur, free),
+        "source": flow.get("source", "tomtom"),
+    }
 
 
 def calculate_eta_for_location(
@@ -165,7 +276,6 @@ def calculate_eta_for_location(
     traffic_condition = TRAFFIC_CONDITIONS.get(congestion_level, TRAFFIC_CONDITIONS["medium"])
 
     now_ist = datetime.now(_IST)
-    from datetime import timedelta
     arrival_time = now_ist + timedelta(minutes=eta_with_buffer_minutes)
 
     logger.info(
@@ -185,5 +295,37 @@ def calculate_eta_for_location(
         confidence=confidence,
         data_age_minutes=data_age_minutes,
         arrival_time=arrival_time,
+        calculated_at=now_ist,
+    )
+
+
+def calculate_eta_from_snapshot(
+    location: str,
+    distance_km: float,
+    mode: str,
+    *,
+    speed_kmh: float,
+    congestion_level: str,
+    confidence: str = "high",
+    data_age_minutes: float = 0.0,
+    vehicle_count: int = 0,
+) -> ETAResponse:
+    """Build an ETAResponse from an already-known speed/congestion snapshot."""
+    mode_speed = get_speed_for_congestion(congestion_level, mode)
+    final_speed = mode_speed if speed_kmh <= 0 else min(speed_kmh, mode_speed)
+    eta_minutes, eta_with_buffer_minutes = calculate_eta_minutes(distance_km, final_speed)
+    now_ist = datetime.now(_IST)
+    return ETAResponse(
+        location=location,
+        distance_km=distance_km,
+        eta_minutes=eta_minutes,
+        eta_with_buffer_minutes=eta_with_buffer_minutes,
+        congestion_level=congestion_level,
+        average_speed_kmh=final_speed,
+        vehicle_count=vehicle_count,
+        traffic_condition=TRAFFIC_CONDITIONS.get(congestion_level, TRAFFIC_CONDITIONS["medium"]),
+        confidence=confidence,
+        data_age_minutes=data_age_minutes,
+        arrival_time=now_ist + timedelta(minutes=eta_with_buffer_minutes),
         calculated_at=now_ist,
     )

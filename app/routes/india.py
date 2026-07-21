@@ -20,13 +20,16 @@ logger = logging.getLogger(__name__)
 _CONGESTION_SCORE = {"low": 0, "medium": 1, "high": 2}
 
 
-def _latest_record(location: str, db: Session) -> Optional[TrafficRecord]:
-    return (
+def _latest_records(locations: list[str], db: Session) -> dict[str, TrafficRecord]:
+    """Fetch one latest observation per location in a single round trip."""
+    rows = (
         db.query(TrafficRecord)
-        .filter(TrafficRecord.location == location)
-        .order_by(TrafficRecord.created_at.desc())
-        .first()
+        .filter(TrafficRecord.location.in_(locations))
+        .distinct(TrafficRecord.location)
+        .order_by(TrafficRecord.location, TrafficRecord.created_at.desc())
+        .all()
     )
+    return {row.location: row for row in rows}
 
 
 def _grade(score: float) -> tuple[str, str]:
@@ -58,8 +61,9 @@ def india_live_snapshot(
 
     now = datetime.now(timezone.utc)
     all_items = []
+    latest_records = _latest_records([loc["name"] for loc in locs], db)
     for loc in locs:
-        rec = _latest_record(loc["name"], db)
+        rec = latest_records.get(loc["name"])
         if rec is None:
             flow       = _simulate_flow(loc["lat"], loc["lng"])
             cur_speed  = float(flow["currentSpeed"])
@@ -149,24 +153,30 @@ def india_cities_summary(
     for loc in INDIA_LOCATIONS:
         city_groups.setdefault(loc["city"], []).append(loc)
 
+    all_names = [loc["name"] for loc in INDIA_LOCATIONS]
+    recent_records = (
+        db.query(TrafficRecord)
+        .filter(TrafficRecord.location.in_(all_names), TrafficRecord.created_at >= since)
+        .all()
+    )
+    records_by_location: dict[str, list[TrafficRecord]] = {}
+    for record in recent_records:
+        records_by_location.setdefault(record.location, []).append(record)
+    incident_counts = Counter(
+        location
+        for (location,) in db.query(Incident.location)
+        .filter(Incident.location.in_(all_names), Incident.is_active.is_(True))
+        .all()
+    )
+
     for city, locs in city_groups.items():
-        records = (
-            db.query(TrafficRecord)
-            .filter(
-                TrafficRecord.location.in_([l["name"] for l in locs]),
-                TrafficRecord.created_at >= since,
-            )
-            .all()
-        )
+        records = [
+            record
+            for loc in locs
+            for record in records_by_location.get(loc["name"], [])
+        ]
         state = locs[0]["state"]
-        incidents = (
-            db.query(Incident)
-            .filter(
-                Incident.location.in_([l["name"] for l in locs]),
-                Incident.is_active.is_(True),
-            )
-            .count()
-        )
+        incidents = sum(incident_counts.get(loc["name"], 0) for loc in locs)
 
         if not records:
             result.append({
@@ -218,16 +228,23 @@ def india_states_summary(
     for loc in INDIA_LOCATIONS:
         state_groups.setdefault(loc["state"], []).append(loc)
 
+    all_names = [loc["name"] for loc in INDIA_LOCATIONS]
+    recent_records = (
+        db.query(TrafficRecord)
+        .filter(TrafficRecord.location.in_(all_names), TrafficRecord.created_at >= since)
+        .all()
+    )
+    records_by_location: dict[str, list[TrafficRecord]] = {}
+    for record in recent_records:
+        records_by_location.setdefault(record.location, []).append(record)
+
     result = []
     for state, locs in state_groups.items():
-        records = (
-            db.query(TrafficRecord)
-            .filter(
-                TrafficRecord.location.in_([l["name"] for l in locs]),
-                TrafficRecord.created_at >= since,
-            )
-            .all()
-        )
+        records = [
+            record
+            for loc in locs
+            for record in records_by_location.get(loc["name"], [])
+        ]
         if not records:
             result.append({"state": state, "cities": len({l["city"] for l in locs}),
                            "health_score": 50, "grade": "C", "avg_speed_kmh": None})
@@ -317,31 +334,48 @@ def india_hotspots(
     limit: int = Query(10, ge=1, le=50, description="Number of worst locations to return"),
     db: Session = Depends(get_db),
 ) -> dict:
-    """Top N most congested locations across India right now."""
-    now   = datetime.now(timezone.utc)
-    since = now - timedelta(hours=1)
+    """Top N most congested locations across India right now.
+
+    Falls back to a 6-hour window when the last 2 hours have no data (e.g. fresh server start).
+    """
+    now = datetime.now(timezone.utc)
     results = []
+    six_hours_ago = now - timedelta(hours=6)
+    two_hours_ago = now - timedelta(hours=2)
+    rows = (
+        db.query(TrafficRecord)
+        .filter(
+            TrafficRecord.location.in_([loc["name"] for loc in INDIA_LOCATIONS]),
+            TrafficRecord.created_at >= six_hours_ago,
+        )
+        .order_by(TrafficRecord.location, TrafficRecord.created_at.desc())
+        .all()
+    )
+    records_by_location: dict[str, list[TrafficRecord]] = {}
+    for row in rows:
+        records_by_location.setdefault(row.location, []).append(row)
 
     for loc in INDIA_LOCATIONS:
-        recs = (
-            db.query(TrafficRecord)
-            .filter(
-                TrafficRecord.location == loc["name"],
-                TrafficRecord.created_at >= since,
-            )
-            .order_by(TrafficRecord.created_at.desc())
-            .limit(3)
-            .all()
-        )
+        available = records_by_location.get(loc["name"], [])
+        recent = []
+        for row in available:
+            created = row.created_at
+            if created and created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            if created and created >= two_hours_ago:
+                recent.append(row)
+        recs = (recent or available)[:3]
         if not recs:
             continue
         latest = recs[0]
-        score  = _CONGESTION_SCORE.get(latest.congestion_level or "low", 0)
+        speeds = [r.average_speed for r in recs if r.average_speed]
+        avg_speed = sum(speeds) / len(speeds) if speeds else latest.average_speed
+        score = _CONGESTION_SCORE.get(latest.congestion_level or "low", 0)
         results.append({
             "location": loc["name"], "city": loc["city"], "state": loc["state"],
             "lat": loc["lat"], "lng": loc["lng"],
-            "congestion_level": latest.congestion_level,
-            "avg_speed_kmh": latest.average_speed,
+            "congestion_level": latest.congestion_level or "low",
+            "avg_speed_kmh": round(avg_speed, 1) if avg_speed else None,
             "vehicle_count": latest.vehicle_count,
             "_score": score,
         })
@@ -350,9 +384,11 @@ def india_hotspots(
     for r in results:
         r.pop("_score", None)
 
+    top = results[:limit]
     return {
         "total_evaluated": len(results),
-        "top_congested": results[:limit],
+        "hotspots": top,          # primary key (frontend-friendly)
+        "top_congested": top,     # backward-compat alias
         "generated_at": now.isoformat(),
     }
 

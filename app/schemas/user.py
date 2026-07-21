@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 
 class UserCreate(BaseModel):
@@ -47,15 +47,36 @@ class UserResponse(BaseModel):
     id: uuid.UUID
     email: EmailStr
     full_name: str
+    # Frontend header/profile often read `.name` / `.display_name` / camelCase
+    name: Optional[str] = None
+    display_name: Optional[str] = None
+    fullName: Optional[str] = None
+    displayName: Optional[str] = None
+    avatar_initial: Optional[str] = None
+    avatarInitial: Optional[str] = None
     is_active: bool
     is_admin: bool
     is_verified: bool
     auth_provider: str
     picture_url: Optional[str] = None
+    pictureUrl: Optional[str] = None
     last_login: Optional[datetime] = None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True, extra="ignore")
+
+    @model_validator(mode="after")
+    def _fill_name_aliases(self) -> "UserResponse":
+        display = (self.full_name or "").strip() or self.email.split("@")[0]
+        initial = display[0].upper() if display else "U"
+        self.name = self.name or display
+        self.display_name = self.display_name or display
+        self.fullName = self.fullName or display
+        self.displayName = self.displayName or display
+        self.avatar_initial = self.avatar_initial or initial
+        self.avatarInitial = self.avatarInitial or initial
+        self.pictureUrl = self.pictureUrl if self.pictureUrl is not None else self.picture_url
+        return self
 
 
 class TokenResponse(BaseModel):

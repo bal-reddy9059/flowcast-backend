@@ -142,19 +142,38 @@ class RouteResponse(BaseModel):
 
 
 class SavedRouteCreate(BaseModel):
-    """Request schema for saving a user-defined route."""
+    """Request schema for saving a user-defined route.
+
+    Coordinates are optional — when omitted, origin_name / destination_name are
+    geocoded against known India locations (same resolver as POST /optimize).
+    """
 
     route_name: str = Field(..., min_length=3, max_length=100, description="Label for the saved route", example="Home to Office")
-    origin_lat: float = Field(..., description="Origin latitude", example=17.3850)
-    origin_lng: float = Field(..., description="Origin longitude", example=78.4867)
-    destination_lat: float = Field(..., description="Destination latitude", example=17.4400)
-    destination_lng: float = Field(..., description="Destination longitude", example=78.3900)
     origin_name: str = Field(..., max_length=200, description="Human readable origin label", example="Gachibowli")
     destination_name: str = Field(..., max_length=200, description="Human readable destination label", example="Hitech City")
+    origin_lat: Optional[float] = Field(None, description="Origin latitude (optional if origin_name can be geocoded)", example=17.3850)
+    origin_lng: Optional[float] = Field(None, description="Origin longitude (optional if origin_name can be geocoded)", example=78.4867)
+    destination_lat: Optional[float] = Field(None, description="Destination latitude (optional)", example=17.4400)
+    destination_lng: Optional[float] = Field(None, description="Destination longitude (optional)", example=78.3900)
+    mode: Optional[str] = Field(
+        "driving",
+        description="Travel mode hint (accepted for client convenience; not stored on the route)",
+        example="driving",
+    )
 
     model_config = ConfigDict(
-        extra="forbid",
+        extra="ignore",
     )
+
+    @field_validator("mode")
+    @classmethod
+    def validate_mode(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return "driving"
+        if value not in ALLOWED_MODES:
+            raise ValueError("mode must be one of: driving, walking, transit")
+        return value
+
 
 
 class SavedRouteResponse(BaseModel):

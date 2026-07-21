@@ -15,9 +15,12 @@ REST fallback:
 """
 
 import logging
-from datetime import datetime, timezone
+import threading
+import time
+from datetime import datetime
 from difflib import SequenceMatcher
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect, status
 from sqlalchemy.orm import Session
@@ -32,6 +35,14 @@ from typing import List
 
 router = APIRouter(prefix="/india", tags=["India Districts"])
 logger = logging.getLogger(__name__)
+_IST = ZoneInfo("Asia/Kolkata")
+
+# Keep simulated fallback values stable across list/state/detail requests.
+# Previously every endpoint call generated new random values for the same
+# district, making simultaneous responses contradict each other.
+_SIMULATION_TTL_SECONDS = 300
+_simulation_cache: dict[str, tuple[float, dict]] = {}
+_simulation_lock = threading.Lock()
 
 # Common Indian state abbreviations → full names
 _STATE_ABBR: dict[str, str] = {
@@ -80,6 +91,32 @@ def _district_matches(search: str, district: str) -> bool:
     if s in d or d in s:
         return True
     return SequenceMatcher(None, s, d).ratio() >= 0.75
+
+
+def _fallback_entry(meta: dict) -> dict:
+    """Return one stable simulated reading per district for five minutes."""
+    key = meta["district"]
+    now_monotonic = time.monotonic()
+    with _simulation_lock:
+        cached = _simulation_cache.get(key)
+        if cached and now_monotonic - cached[0] < _SIMULATION_TTL_SECONDS:
+            return dict(cached[1])
+
+        sim = _simulate_district(meta["lat"], meta["lng"])
+        entry = {
+            "district": meta["district"],
+            "state": meta["state"],
+            "lat": meta["lat"],
+            "lng": meta["lng"],
+            "speed_kmh": sim["speed_kmh"],
+            "congestion_level": sim["congestion_level"],
+            "vehicle_count": _estimate_vehicles(sim["speed_kmh"]),
+            "congestion_ratio": sim["congestion_ratio"],
+            "source": "simulated",
+            "updated_at": datetime.now(_IST).isoformat(),
+        }
+        _simulation_cache[key] = (now_monotonic, entry)
+        return dict(entry)
 
 
 # Anonymous WebSocket pool for district broadcast (no auth required)
@@ -174,20 +211,7 @@ def list_districts(
             entry.setdefault("lat",      d["lat"])
             entry.setdefault("lng",      d["lng"])
         else:
-            # Collector hasn't reached this district yet — use simulation
-            sim = _simulate_district(d["lat"], d["lng"])
-            entry = {
-                "district":         d["district"],
-                "state":            d["state"],
-                "lat":              d["lat"],
-                "lng":              d["lng"],
-                "speed_kmh":        sim["speed_kmh"],
-                "congestion_level": sim["congestion_level"],
-                "vehicle_count":    _estimate_vehicles(sim["speed_kmh"]),
-                "congestion_ratio": sim["congestion_ratio"],
-                "source":           "simulated",
-                "updated_at":       datetime.now(timezone.utc).isoformat(),
-            }
+            entry = _fallback_entry(d)
         all_entries.append(entry)
 
     # Apply congestion filter; fall back to all entries when filter matches nothing
@@ -238,19 +262,7 @@ def districts_by_state(state_name: str) -> dict:
         if cached:
             results.append(dict(cached))
         else:
-            sim = _simulate_district(d["lat"], d["lng"])
-            results.append({
-                "district":         d["district"],
-                "state":            d["state"],
-                "lat":              d["lat"],
-                "lng":              d["lng"],
-                "speed_kmh":        sim["speed_kmh"],
-                "congestion_level": sim["congestion_level"],
-                "vehicle_count":    _estimate_vehicles(sim["speed_kmh"]),
-                "congestion_ratio": sim["congestion_ratio"],
-                "source":           "simulated",
-                "updated_at":       datetime.now(timezone.utc).isoformat(),
-            })
+            results.append(_fallback_entry(d))
 
     high   = sum(1 for r in results if r.get("congestion_level") == "high")
     medium = sum(1 for r in results if r.get("congestion_level") == "medium")
@@ -281,19 +293,7 @@ def district_detail(district_name: str) -> dict:
         from fastapi import HTTPException
         raise HTTPException(status_code=404, detail=f"District '{district_name}' not found")
 
-    sim = _simulate_district(meta["lat"], meta["lng"])
-    return {
-        "district":         meta["district"],
-        "state":            meta["state"],
-        "lat":              meta["lat"],
-        "lng":              meta["lng"],
-        "speed_kmh":        sim["speed_kmh"],
-        "congestion_level": sim["congestion_level"],
-        "vehicle_count":    _estimate_vehicles(sim["speed_kmh"]),
-        "congestion_ratio": sim["congestion_ratio"],
-        "source":           "simulated",
-        "updated_at":       datetime.now(timezone.utc).isoformat(),
-    }
+    return _fallback_entry(meta)
 
 
 @router.get("/districts-states", status_code=status.HTTP_200_OK)

@@ -22,15 +22,24 @@ Real-time traffic prediction and monitoring API for India — built with FastAPI
   - [Heatmap](#heatmap)
   - [Notifications](#notifications)
   - [Route Optimization](#route-optimization)
+  - [Multi-Modal Journey Planner](#multi-modal-journey-planner)
   - [Commute Planner](#commute-planner)
   - [Favorite Locations](#favorite-locations)
   - [User Preferences](#user-preferences)
   - [Trip History](#trip-history)
   - [Departure Alerts](#departure-alerts)
   - [Carbon Footprint](#carbon-footprint)
+  - [Weather Impact](#weather-impact)
   - [India Traffic](#india-traffic)
   - [India Districts (WebSocket)](#india-districts-websocket)
   - [Area Prediction](#area-prediction)
+  - [AI Traffic Copilot](#ai-traffic-copilot)
+  - [Organization Management](#organization-management)
+  - [Fleet Management](#fleet-management)
+  - [Geofence Zones](#geofence-zones)
+  - [Webhook Integrations](#webhook-integrations)
+  - [Alert Rules Engine](#alert-rules-engine)
+  - [Traffic Reports](#traffic-reports)
   - [Admin](#admin)
 - [WebSocket Endpoints](#websocket-endpoints)
 - [Background Services](#background-services)
@@ -49,9 +58,17 @@ FlowCast is a production-grade backend API that provides:
 - **Real-time traffic monitoring** across India (766 districts, major cities)
 - **ML-powered congestion prediction** using scikit-learn
 - **Live ETA calculation** with congestion-aware speed adjustment
-- **Route optimization** via Google Maps Directions API
+- **Route optimization** via Google Maps Directions API + multi-modal journey planning
 - **Departure alert system** with WebSocket push notifications
 - **Carbon footprint calculator** for mode comparison
+- **Weather-traffic correlation** with congestion impact modifiers
+- **Organization management** with multi-user workspaces (Owner / Admin / Member roles)
+- **Fleet management** with vehicle tracking and driver behavior scoring
+- **Smart geofence zones** with configurable congestion threshold alerts
+- **Webhook integrations** for real-time event delivery to external systems
+- **Custom alert rules engine** with condition-based triggers
+- **AI Traffic Copilot** — natural language traffic intelligence powered by Claude
+- **On-demand and scheduled traffic reports**
 - **Admin dashboard** with system health monitoring
 
 ---
@@ -66,7 +83,8 @@ FlowCast is a production-grade backend API that provides:
 | Auth | JWT (HS256) + Google OAuth 2.0 |
 | ML / Prediction | scikit-learn (RandomForest / LinearRegression) |
 | Real-time | WebSockets (FastAPI native) |
-| External APIs | Google Maps Directions, TomTom Traffic, OpenRouteService |
+| External APIs | Google Maps Directions, TomTom Traffic, OpenRouteService, OpenWeatherMap |
+| AI | Claude (Anthropic) — AI Copilot chat |
 | Python | 3.12 |
 
 ---
@@ -85,13 +103,15 @@ API GATEWAY (FastAPI / uvicorn)
 ROUTE MODULES  /api/v1/...
   /auth  /traffic  /eta  /analytics  /heatmap  /notifications
   /routes  /commute  /favorites  /preferences  /trips  /alerts
-  /eco  /india  /prediction  /admin
+  /eco  /india  /prediction  /weather  /ai  /org  /fleet
+  /zones  /webhooks  /rules  /reports  /admin
         │
         ▼
 SERVICE LAYER
   AuthService · ETAService · RouteService · NotificationService
   HeatmapService · AlertService · PredictionService · RealtimeCollector
-  DistrictCollector · ConnectionManager · CityAliases
+  DistrictCollector · ConnectionManager · CityAliases · WeatherService
+  BehaviorService · WebhookService
         │
         ▼
 DATA LAYER
@@ -100,6 +120,7 @@ DATA LAYER
         ▼
 EXTERNAL SERVICES
   Google Maps API · Google OAuth 2.0 · TomTom Traffic · OpenRouteService
+  OpenWeatherMap · Anthropic Claude API
 ```
 
 The architecture diagram (`flowcast_architecture.png`) provides a full visual breakdown of all layers and components.
@@ -152,7 +173,7 @@ On first startup FlowCast will:
 - Run schema migrations (UUID column upgrades)
 - Create all tables via `create_all()`
 - Seed the default admin account (`admin@flowcast.in` / `Admin@1234`)
-- Start background monitors (congestion, departure alerts, India traffic, district collector)
+- Start background monitors (congestion, departure alerts, India traffic, district collector, zone alert monitor)
 
 ### 5. Open the docs
 
@@ -179,6 +200,8 @@ On first startup FlowCast will:
 | `GOOGLE_REDIRECT_URI` | No | OAuth callback URL (must match Google Console) |
 | `TOMTOM_API_KEY` | No | TomTom Traffic API key (2500 req/day free) |
 | `ORS_API_KEY` | No | OpenRouteService API key (free) |
+| `OPENWEATHERMAP_API_KEY` | No | OpenWeatherMap API key (weather-traffic correlation) |
+| `ANTHROPIC_API_KEY` | No | Anthropic API key (AI Traffic Copilot) |
 | `REDIS_URL` | No | Redis connection string (default: `redis://localhost:6379`) |
 | `ADMIN_EMAIL` | No | Admin account email (default: `admin@flowcast.in`) |
 | `ADMIN_PASSWORD` | No | Admin account password (default: `Admin@1234`) |
@@ -323,6 +346,22 @@ Base path: `/api/v1/analytics`
 | GET | `/analytics/city-health` | JWT | City health score (0–100) |
 | GET | `/analytics/timelapse` | JWT | Hourly heatmap frames for animation |
 
+**`/analytics/trends` query parameters:**
+- `location` — area name (optional)
+- `hours` — look-back window (default: 24)
+
+**`/analytics/city-health` response:**
+```json
+{
+  "city": "Hyderabad",
+  "health_score": 72,
+  "congestion_index": 0.28,
+  "avg_speed_kmh": 34.5,
+  "incident_count": 3,
+  "trend": "improving"
+}
+```
+
 ---
 
 ### Heatmap
@@ -341,11 +380,32 @@ Base path: `/api/v1/notifications`
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| GET | `/notifications` | JWT | List notifications (paginated) |
-| PUT | `/notifications/{id}/read` | JWT | Mark one notification as read |
-| PUT | `/notifications/read-all` | JWT | Mark all notifications as read |
-| DELETE | `/notifications/{id}` | JWT | Delete a notification |
+| GET | `/notifications` | JWT | List notifications (paginated, auto-seeded on first visit) |
 | GET | `/notifications/stats` | JWT | Notification statistics |
+| PUT | `/notifications/read-all` | JWT | Mark all notifications as read |
+| PUT | `/notifications/{id}/read` | JWT | Mark one notification as read |
+| DELETE | `/notifications/{id}` | JWT | Delete a notification |
+| WS | `/notifications/ws/{user_id}` | No | Real-time notification push stream |
+
+On first visit, FlowCast auto-seeds 8 realistic notifications (congestion alerts, zone alerts, departure reminders, weather warnings) with location context extracted from notification titles.
+
+**`GET /notifications` query parameters:**
+- `skip`, `limit` — pagination (default: 0 / 50)
+- `unread_only` — `true` to filter unread
+
+**Notification object:**
+```json
+{
+  "id": "<uuid>",
+  "type": "congestion_alert",
+  "title": "Critical Congestion — Silk Board Junction",
+  "message": "Vehicle count up 60% in the last 15 minutes.",
+  "severity": "critical",
+  "location": "Silk Board Junction",
+  "is_read": false,
+  "created_at": "2026-06-14T08:22:10+05:30"
+}
+```
 
 **Stats response:**
 ```json
@@ -376,13 +436,51 @@ Base path: `/api/v1/routes`
 
 Coordinates must be within India: **lat 6.0–37.5, lng 68.0–97.5**.
 
-**Optimize request:**
+**Optimize request (coordinates or location names):**
 ```json
 {
-  "origin": { "lat": 17.4486, "lng": 78.3908 },
-  "destination": { "lat": 17.3850, "lng": 78.4867 },
+  "origin": "Miyapur",
+  "destination": "Hitech City",
   "mode": "driving",
   "alternatives": true
+}
+```
+
+You may also pass coordinate objects: `{ "lat": 17.4486, "lng": 78.3908 }`.
+
+---
+
+### Multi-Modal Journey Planner
+
+Base path: `/api/v1/routes`
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/routes/multimodal` | JWT | Compare all transport modes for a journey |
+
+Returns a side-by-side comparison of driving, motorcycle, bus, metro, cycling, and walking — each with ETA, distance, CO₂ emissions, calories burned, and a recommendation score. Accepts location names or coordinates.
+
+**Query parameters:**
+- `origin` — departure location (name or `lat,lng`)
+- `destination` — arrival location (name or `lat,lng`)
+
+**Response:**
+```json
+{
+  "origin": "Andheri East",
+  "destination": "BKC",
+  "recommended_mode": "metro",
+  "modes": [
+    {
+      "mode": "metro",
+      "eta_minutes": 22,
+      "distance_km": 8.4,
+      "co2_kg": 0.08,
+      "calories": 0,
+      "cost_inr": 40,
+      "score": 91
+    }
+  ]
 }
 ```
 
@@ -397,6 +495,20 @@ Base path: `/api/v1/commute`
 | GET | `/commute/forecast` | JWT | 24-hour rush-hour forecast for a location |
 | GET | `/commute/best-departure` | JWT | Optimal departure window to avoid congestion |
 | GET | `/commute/score` | JWT | Commute friendliness score (0–100) |
+
+**`/commute/forecast` response includes `hourly` array:**
+```json
+{
+  "location": "Gachibowli",
+  "date": "2026-06-14",
+  "peak_hours": ["08:00–10:00", "17:30–19:30"],
+  "best_departure": "07:15",
+  "hourly": [
+    { "hour": "06:00", "congestion": "low", "score": 88 },
+    { "hour": "08:00", "congestion": "high", "score": 32 }
+  ]
+}
+```
 
 ---
 
@@ -505,7 +617,7 @@ When an alert fires, a **WebSocket push** is sent to all connected sessions for 
 }
 ```
 
-Duplicate alerts (same user + route name + departure time) are rejected with `409 Conflict`.
+`days_of_week` accepts full day names (e.g. `"monday"`) or short forms (`"mon"`). Duplicate alerts (same user + route name + departure time) are rejected with `409 Conflict`.
 
 ---
 
@@ -539,6 +651,60 @@ Base path: `/api/v1/eco`
 
 ---
 
+### Weather Impact
+
+Base path: `/api/v1/weather`
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/weather/cities` | No | Live weather snapshot for all 20 monitored cities |
+| GET | `/weather/city-ids` | No | Directory of stable `city_id` → city name mappings |
+| GET | `/weather/city/{city_id}` | No | Weather + congestion impact for one city (by UUID) |
+| GET | `/weather/impact` | No | Weather impact for any traffic location string |
+| GET | `/weather/status` | No | Cache freshness and OWM configuration status |
+
+**`/weather/cities` response:**
+```json
+{
+  "total": 20,
+  "severe_impact": 0,
+  "moderate_impact": 2,
+  "light_impact": 5,
+  "clear_cities": 13,
+  "network_alert": "minor",
+  "cities": [
+    {
+      "city": "Mumbai",
+      "city_id": "<uuid>",
+      "temp_c": 31.2,
+      "temp": 31.2,
+      "condition": "Heavy Rain",
+      "wind_kmh": 42.0,
+      "wind": 42.0,
+      "visibility_km": 3.1,
+      "visibility": 3.1,
+      "congestion_modifier": "moderate",
+      "congestionModifier": 0.3,
+      "alert_level": "caution"
+    }
+  ]
+}
+```
+
+`city_id` values are stable UUID5 hashes of the city name — safe to store in the frontend. Pass any traffic location string to `/weather/impact` to get the nearest city's congestion modifier.
+
+**Congestion modifier levels:**
+| Modifier | Float | Meaning |
+|---|---|---|
+| `none` | 0.0 | Normal driving conditions |
+| `light` | 0.1 | Minor slowdowns possible |
+| `moderate` | 0.3 | 20–40% longer travel times |
+| `severe` | 0.5 | Major delays — consider postponing |
+
+Data source: OpenWeatherMap (if `OPENWEATHERMAP_API_KEY` is set) or simulated data. Cache refreshed every 30 minutes.
+
+---
+
 ### India Traffic
 
 Base path: `/api/v1/india`
@@ -569,7 +735,7 @@ Covers 50+ cities across all Indian states. Data is refreshed every 60 seconds v
 const ws = new WebSocket("ws://localhost:8000/api/v1/india/ws/districts");
 ws.onmessage = (event) => {
   const data = JSON.parse(event.data);
-  // data: { districts: [...], timestamp: "2026-05-27T14:32:10+05:30" }
+  // data: { districts: [...], timestamp: "2026-06-14T14:32:10+05:30" }
 };
 ```
 
@@ -588,6 +754,266 @@ Base path: `/api/v1/prediction`
 | GET | `/prediction/compare` | JWT | Side-by-side multi-area comparison |
 
 The prediction service uses a scikit-learn model trained on historical traffic records. Features include: hour of day, vehicle count, road type, and day of week.
+
+---
+
+### AI Traffic Copilot
+
+Base path: `/api/v1/ai`
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| POST | `/ai/chat` | JWT | Ask any traffic question in natural language |
+| GET | `/ai/departure` | JWT | AI-recommended departure time for a journey |
+| GET | `/ai/model-info` | JWT | ML model metadata and performance stats |
+| GET | `/ai/forecast` | JWT | AI-enhanced congestion forecast |
+
+Powered by Claude (Anthropic) with live FlowCast traffic data injected as context.
+
+**Chat request:**
+```json
+{
+  "message": "Should I leave for the airport now or wait 30 minutes?",
+  "location": "Powai",
+  "destination": "Mumbai Airport"
+}
+```
+
+**`/ai/departure` query parameters:**
+- `origin` — departure location
+- `destination` — arrival location
+- `target_arrival` — desired arrival time (e.g. `"09:00"`)
+- `distance_km` — optional; auto-calculated from location names if omitted
+
+**`/ai/forecast` response includes:**
+- `hourly` — list of hourly congestion predictions
+- `confidence` — model confidence score
+- `weather_adjusted` — whether weather modifier was applied
+- `recommendations` — natural language tips
+
+---
+
+### Organization Management
+
+Base path: `/api/v1/org`
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/org` | JWT | Get your primary organization |
+| GET | `/org/members` | JWT | List all members of your organization |
+| POST | `/org/invite` | JWT | Invite a user by email |
+| PUT | `/org/members/{user_id}` | JWT | Change a member's role |
+| DELETE | `/org/members/{user_id}` | JWT | Remove a member |
+
+On first call, FlowCast auto-creates a personal workspace (`"{Name}'s Workspace"`) if the user has no organization.
+
+**`GET /org` response:**
+```json
+{
+  "id": "<uuid>",
+  "name": "Ravi's Workspace",
+  "plan": "enterprise",
+  "my_role": "owner",
+  "your_role": "owner"
+}
+```
+
+**`GET /org/members` response:**
+```json
+{
+  "members": [
+    {
+      "id": "<uuid>",
+      "user_id": "<uuid>",
+      "full_name": "Ravi Kumar",
+      "email": "ravi@example.com",
+      "role": "owner",
+      "joined_at": "2026-06-14T10:00:00+05:30",
+      "is_active": true
+    }
+  ],
+  "total": 1
+}
+```
+
+**Invite request:**
+```json
+{ "email": "teammate@example.com", "role": "member" }
+```
+
+**Role change request:**
+```json
+{ "role": "admin" }
+```
+
+Roles (ascending): `member` → `admin` → `owner`. Only owners can change roles or remove members.
+
+---
+
+### Fleet Management
+
+Base path: `/api/v1/fleet`
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/fleet/vehicles` | JWT | List vehicles in your organization |
+| POST | `/fleet/vehicles` | JWT | Register a new vehicle |
+| GET | `/fleet/vehicles/{id}` | JWT | Get vehicle detail + current ETA |
+| PUT | `/fleet/vehicles/{id}` | JWT | Update vehicle info |
+| DELETE | `/fleet/vehicles/{id}` | JWT | Remove a vehicle |
+| GET | `/fleet/assignments` | JWT | List driver-vehicle assignments |
+| POST | `/fleet/assignments` | JWT | Assign a driver to a vehicle |
+| DELETE | `/fleet/assignments/{id}` | JWT | Remove an assignment |
+| GET | `/fleet/behavior/{vehicle_id}` | JWT | Driver behavior logs for a vehicle |
+| GET | `/fleet/scores` | JWT | Daily driver behavior scores |
+| GET | `/fleet/summary` | JWT | Fleet-wide overview |
+
+**Register vehicle request:**
+```json
+{
+  "org_id": "<uuid>",
+  "registration": "MH02AB1234",
+  "make": "Tata",
+  "model": "Nexon",
+  "vehicle_type": "car",
+  "current_location": "Andheri East"
+}
+```
+
+Driver behavior scoring tracks: harsh braking, rapid acceleration, speeding events, and smooth-driving streaks — aggregated into a daily score (0–100).
+
+---
+
+### Geofence Zones
+
+Base path: `/api/v1/zones`
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/zones` | JWT | List geofence zones (auto-seeds 5 demo zones) |
+| POST | `/zones` | JWT | Create a new zone |
+| GET | `/zones/{id}` | JWT | Get zone detail + current congestion health |
+| PUT | `/zones/{id}` | JWT | Update zone config |
+| DELETE | `/zones/{id}` | JWT | Delete a zone |
+| GET | `/zones/{id}/alerts` | JWT | Alert history for a zone |
+| GET | `/zones/summary` | JWT | All-zones congestion overview |
+
+**Zone types:** `rectangle` (lat/lng bounding box) or `circle` (center + radius).
+
+**Create zone request:**
+```json
+{
+  "name": "Silk Board Corridor",
+  "city": "Bangalore",
+  "zone_type": "circle",
+  "center_lat": 12.9176,
+  "center_lng": 77.6229,
+  "radius_km": 2.5,
+  "congestion_threshold": "high"
+}
+```
+
+When a zone's average congestion reaches its threshold, a `ZoneAlert` is recorded and a push notification is sent. A **30-minute DB-backed cooldown** prevents duplicate alerts from firing on server restarts.
+
+---
+
+### Webhook Integrations
+
+Base path: `/api/v1/webhooks`
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/webhooks` | JWT | List your registered webhooks |
+| POST | `/webhooks` | JWT | Register a new webhook endpoint |
+| GET | `/webhooks/{id}` | JWT | Get webhook detail + delivery stats |
+| PUT | `/webhooks/{id}` | JWT | Update webhook config |
+| DELETE | `/webhooks/{id}` | JWT | Delete a webhook |
+| GET | `/webhooks/{id}/deliveries` | JWT | Recent delivery log |
+| POST | `/webhooks/{id}/test` | JWT | Send a test payload |
+| GET | `/webhooks/events` | JWT | List all supported event types |
+
+**Register webhook request:**
+```json
+{
+  "name": "Slack Congestion Alerts",
+  "url": "https://hooks.slack.com/services/...",
+  "events": ["congestion_spike", "zone_alert"],
+  "secret": "optional-hmac-secret"
+}
+```
+
+**Supported events:**
+| Event | Trigger |
+|---|---|
+| `congestion_spike` | Location jumps to high congestion |
+| `congestion_clearing` | Congestion drops from high |
+| `zone_alert` | Geofence zone hits threshold |
+| `departure_alert` | Departure reminder fires |
+| `incident_new` | New road incident reported |
+| `rule_triggered` | Custom alert rule condition met |
+| `speed_drop` | Average speed drops >20% |
+| `speed_recovery` | Average speed recovers >20% |
+| `*` | Wildcard — all events |
+
+Webhook deliveries include HMAC-SHA256 signature in `X-FlowCast-Signature` header when a secret is set.
+
+---
+
+### Alert Rules Engine
+
+Base path: `/api/v1/rules`
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/rules` | JWT | List your alert rules |
+| POST | `/rules` | JWT | Create a rule |
+| GET | `/rules/{id}` | JWT | Get rule detail + evaluation history |
+| PUT | `/rules/{id}` | JWT | Update a rule |
+| DELETE | `/rules/{id}` | JWT | Delete a rule |
+| POST | `/rules/{id}/toggle` | JWT | Enable / disable a rule |
+| GET | `/rules/{id}/evaluations` | JWT | Recent rule evaluation log |
+
+**Create rule request:**
+```json
+{
+  "name": "Silk Board High Congestion",
+  "location": "Silk Board Junction",
+  "condition_metric": "congestion_level",
+  "condition_operator": ">=",
+  "condition_value": "high",
+  "duration_minutes": 5,
+  "action_type": "notify",
+  "cooldown_minutes": 30
+}
+```
+
+**Metrics:** `congestion_level`, `average_speed`, `vehicle_count`  
+**Operators:** `>=`, `<=`, `==`, `>`, `<`  
+**Action types:** `notify`, `webhook`, `both`
+
+---
+
+### Traffic Reports
+
+Base path: `/api/v1/reports`
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/reports/daily-summary` | JWT | 24-hour congestion report for a location |
+| GET | `/reports/weekly` | JWT | 7-day trend report |
+| GET | `/reports/scheduled` | JWT | List scheduled report subscriptions |
+| POST | `/reports/scheduled` | JWT | Subscribe to a recurring report |
+| DELETE | `/reports/scheduled/{id}` | JWT | Cancel a scheduled report |
+
+**`/reports/daily-summary` query parameters:**
+- `location` — area name (required)
+
+**Daily summary response includes:**
+- Hourly congestion breakdown
+- Peak hour identification
+- Incident count
+- City health score
+- Average speed
 
 ---
 
@@ -624,7 +1050,16 @@ ws://localhost:8000/api/v1/ws/{user_id}
 Receives real-time pushes for:
 - High-congestion alerts on saved routes
 - Departure alert fires
+- Zone threshold alerts
 - System notifications
+
+### Notification stream
+
+```
+ws://localhost:8000/api/v1/notifications/ws/{user_id}
+```
+
+Dedicated notification WebSocket — same push content, separate channel.
 
 ### India district live feed
 
@@ -638,7 +1073,7 @@ Public endpoint. Broadcasts district-level traffic data for all 766 Indian distr
 
 ## Background Services
 
-Four asyncio tasks run continuously after startup:
+Five asyncio tasks run continuously after startup:
 
 | Service | Interval | Description |
 |---|---|---|
@@ -646,6 +1081,9 @@ Four asyncio tasks run continuously after startup:
 | Departure Alert Monitor | 60 s | Fires scheduled departure reminders N minutes before departure time |
 | India Traffic Collector | 60 s | Polls TomTom API for city-level traffic across India |
 | District Collector | 60 s | Aggregates district-level data and broadcasts via WebSocket |
+| Zone Alert Monitor | 60 s | Checks geofence zones against congestion thresholds; sends alerts with 30-min DB-backed cooldown |
+
+The Zone Alert Monitor uses a DB-backed cooldown (`ZoneAlert.triggered_at`) so duplicate alerts are suppressed even after server restarts.
 
 ---
 
@@ -656,9 +1094,9 @@ Four asyncio tasks run continuously after startup:
 | Table | Primary Key | Description |
 |---|---|---|
 | `users` | UUID | Accounts (local + Google OAuth) |
-| `traffic_records` | Integer + UUID col | Raw traffic observations |
-| `prediction_results` | Integer + UUID col | ML prediction outputs |
-| `incidents` | Integer + UUID col | Reported traffic incidents |
+| `traffic_records` | UUID | Raw traffic observations |
+| `prediction_results` | UUID | ML prediction outputs |
+| `incidents` | UUID | Reported traffic incidents |
 | `saved_routes` | UUID | User-saved optimized routes |
 | `notifications` | UUID | User notification inbox |
 | `favorite_locations` | UUID | Bookmarked places |
@@ -666,6 +1104,29 @@ Four asyncio tasks run continuously after startup:
 | `trip_history` | UUID | Logged journeys |
 | `departure_alerts` | UUID | Scheduled departure reminders |
 | `route_share_tokens` | UUID | Shareable route links |
+
+### Organization tables
+
+| Table | Primary Key | Description |
+|---|---|---|
+| `organizations` | UUID | Workspaces (unique name + slug) |
+| `org_memberships` | UUID | User-to-org membership with role |
+
+### Enterprise tables
+
+| Table | Primary Key | Description |
+|---|---|---|
+| `fleet_vehicles` | UUID | Registered fleet vehicles per org |
+| `fleet_assignments` | UUID | Driver-to-vehicle assignments |
+| `driver_behavior_logs` | UUID | Per-trip driving events |
+| `driver_daily_scores` | UUID | Daily aggregated driver scores |
+| `geofence_zones` | UUID | Rectangle or circle geofence definitions |
+| `zone_alerts` | UUID | Zone threshold breach records |
+| `webhooks` | UUID | Registered webhook endpoints |
+| `webhook_deliveries` | UUID | Delivery log per webhook event |
+| `alert_rules` | UUID | Custom condition-based alert rules |
+| `rule_evaluations` | UUID | Rule evaluation history |
+| `scheduled_reports` | UUID | Recurring report subscriptions |
 
 ### Connection pool
 
@@ -733,9 +1194,42 @@ flowcast-backend/
 │   │   ├── preferences.py
 │   │   ├── trip.py
 │   │   ├── alert.py
-│   │   └── share.py
+│   │   ├── share.py
+│   │   ├── org.py                   # Organization, OrgMembership
+│   │   ├── fleet.py                 # FleetVehicle, FleetAssignment
+│   │   ├── driver_behavior.py       # DriverBehaviorLog, DriverDailyScore
+│   │   ├── zone.py                  # GeofenceZone, ZoneAlert
+│   │   ├── webhook.py               # Webhook, WebhookDelivery
+│   │   ├── rule.py                  # AlertRule, RuleEvaluation
+│   │   └── report.py                # ScheduledReport
 │   ├── routes/                      # FastAPI routers (one per feature area)
-│   ├── schemas/                     # Pydantic request/response models
+│   │   ├── auth.py
+│   │   ├── traffic.py
+│   │   ├── eta.py
+│   │   ├── analytics.py
+│   │   ├── heatmap.py
+│   │   ├── notification.py
+│   │   ├── route.py
+│   │   ├── multimodal.py            # Multi-modal journey planner
+│   │   ├── commute.py
+│   │   ├── favorites.py
+│   │   ├── preferences.py
+│   │   ├── trips.py
+│   │   ├── alerts.py
+│   │   ├── eco.py
+│   │   ├── weather.py               # Weather-traffic correlation
+│   │   ├── india.py
+│   │   ├── india_ws.py
+│   │   ├── prediction.py
+│   │   ├── ai.py                    # AI Traffic Copilot (Claude)
+│   │   ├── org.py                   # Organization management
+│   │   ├── fleet.py                 # Fleet management
+│   │   ├── zones.py                 # Geofence zones
+│   │   ├── webhooks.py              # Webhook integrations
+│   │   ├── rules.py                 # Alert rules engine
+│   │   ├── reports.py               # Traffic reports
+│   │   ├── incidents.py
+│   │   └── admin.py
 │   ├── services/                    # Business logic
 │   │   ├── auth_service.py          # Password hashing, JWT issuance
 │   │   ├── eta_service.py           # Congestion-aware ETA calculation
@@ -744,6 +1238,9 @@ flowcast-backend/
 │   │   ├── heatmap_service.py       # Intensity scoring
 │   │   ├── alert_service.py         # Departure alert firing
 │   │   ├── prediction_service.py    # ML model inference
+│   │   ├── weather_service.py       # OpenWeatherMap + congestion modifiers
+│   │   ├── behavior_service.py      # Driver behavior scoring
+│   │   ├── webhook_service.py       # Webhook delivery + HMAC signing
 │   │   ├── realtime_collector.py    # India traffic polling (TomTom)
 │   │   ├── district_collector.py    # 766-district aggregation + WS broadcast
 │   │   ├── connection_manager.py    # WebSocket session management
@@ -751,6 +1248,7 @@ flowcast-backend/
 │   ├── database.py                  # Engine, session factory, migrations, seeding
 │   └── main.py                      # App factory, router registration, lifespan
 ├── tests/
+├── migrate_notification_locations.py  # One-time SQL migration for notification locations
 ├── generate_diagram.py              # Architecture diagram generator (matplotlib)
 ├── flowcast_architecture.png        # Generated system architecture diagram
 ├── requirements.txt

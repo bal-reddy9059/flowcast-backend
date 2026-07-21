@@ -1,9 +1,7 @@
 """
 Redis caching service for FlowCast.
 
-Provides async helper functions for caching JSON payloads and retrieving
-Redis statistics. This module is used by route handlers to reduce database
-load for frequently requested traffic and ETA data.
+No-ops instantly when Redis is unavailable (never hangs on missing Redis).
 """
 
 import json
@@ -19,12 +17,14 @@ async def get_cache(key: str) -> dict | None:
     """Retrieve a JSON cache entry for the given key."""
     try:
         client = await get_redis_client()
+        if client is None:
+            return None
         raw_value = await client.get(key)
         if raw_value is None:
             return None
         return json.loads(raw_value)
     except Exception as error:
-        logger.warning("Redis cache get failed for key=%s: %s", key, error)
+        logger.debug("Redis cache get failed for key=%s: %s", key, error)
         return None
 
 
@@ -32,33 +32,46 @@ async def set_cache(key: str, value: dict, ttl: int) -> None:
     """Set a JSON cache entry with a TTL in seconds."""
     try:
         client = await get_redis_client()
+        if client is None:
+            return
         await client.set(key, json.dumps(value), ex=ttl)
     except Exception as error:
-        logger.warning("Redis cache set failed for key=%s: %s", key, error)
+        logger.debug("Redis cache set failed for key=%s: %s", key, error)
 
 
 async def delete_cache(key: str) -> None:
     """Delete a specific cache entry by key."""
     try:
         client = await get_redis_client()
+        if client is None:
+            return
         await client.delete(key)
     except Exception as error:
-        logger.warning("Redis cache delete failed for key=%s: %s", key, error)
+        logger.debug("Redis cache delete failed for key=%s: %s", key, error)
 
 
 async def clear_all_cache() -> None:
     """Clear all Redis cache entries for the application."""
     try:
         client = await get_redis_client()
+        if client is None:
+            return
         await client.flushdb()
     except Exception as error:
-        logger.warning("Redis cache flush failed: %s", error)
+        logger.debug("Redis cache flush failed: %s", error)
 
 
 async def get_cache_stats() -> dict[str, Any]:
     """Return Redis cache statistics for monitoring and health checks."""
     try:
         client = await get_redis_client()
+        if client is None:
+            return {
+                "total_keys": 0,
+                "memory_used": "0B",
+                "hit_rate": 0.0,
+                "enabled": False,
+            }
         info = await client.info()
 
         keyspace = info.get("Keyspace", {}) or info.get("keyspace", {})
@@ -74,18 +87,13 @@ async def get_cache_stats() -> dict[str, Any]:
             "total_keys": total_keys,
             "memory_used": used_memory,
             "hit_rate": hit_rate,
+            "enabled": True,
         }
     except Exception as error:
-        logger.warning("Redis cache stats retrieval failed: %s", error)
+        logger.debug("Redis cache stats retrieval failed: %s", error)
         return {
             "total_keys": 0,
             "memory_used": "0B",
             "hit_rate": 0.0,
+            "enabled": False,
         }
-
-
-# Cache key naming conventions:
-# heatmap:{hours}:{filter}:{intensity}
-# eta:{location}:{distance}:{mode}
-# snapshot:{hours}
-# trend:{location}:{intervals}

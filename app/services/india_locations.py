@@ -30,6 +30,7 @@ INDIA_LOCATIONS: list[dict] = [
 
     # ── Karnataka ────────────────────────────────────────────────────────────
     {"name": "MG Road Bengaluru",    "city": "Bengaluru",  "state": "Karnataka",  "lat": 12.9758, "lng": 77.6082, "road_type": "arterial"},
+    {"name": "Marathahalli",         "city": "Bengaluru",  "state": "Karnataka",  "lat": 12.9591, "lng": 77.6974, "road_type": "arterial"},
     {"name": "Electronic City",      "city": "Bengaluru",  "state": "Karnataka",  "lat": 12.8399, "lng": 77.6770, "road_type": "arterial"},
     {"name": "Whitefield",           "city": "Bengaluru",  "state": "Karnataka",  "lat": 12.9698, "lng": 77.7500, "road_type": "arterial"},
     {"name": "Indiranagar",          "city": "Bengaluru",  "state": "Karnataka",  "lat": 12.9784, "lng": 77.6408, "road_type": "residential"},
@@ -49,6 +50,10 @@ INDIA_LOCATIONS: list[dict] = [
     # ── Telangana ────────────────────────────────────────────────────────────
     {"name": "Hitech City",          "city": "Hyderabad",  "state": "Telangana",  "lat": 17.4486, "lng": 78.3908, "road_type": "arterial"},
     {"name": "Gachibowli",           "city": "Hyderabad",  "state": "Telangana",  "lat": 17.4401, "lng": 78.3489, "road_type": "arterial"},
+    {"name": "Banjara Hills",        "city": "Hyderabad",  "state": "Telangana",  "lat": 17.4239, "lng": 78.4738, "road_type": "arterial"},
+    {"name": "Jubilee Hills",        "city": "Hyderabad",  "state": "Telangana",  "lat": 17.4326, "lng": 78.4071, "road_type": "arterial"},
+    {"name": "Madhapur",             "city": "Hyderabad",  "state": "Telangana",  "lat": 17.4484, "lng": 78.3915, "road_type": "arterial"},
+    {"name": "Kondapur",             "city": "Hyderabad",  "state": "Telangana",  "lat": 17.4647, "lng": 78.3578, "road_type": "arterial"},
     {"name": "Ameerpet",             "city": "Hyderabad",  "state": "Telangana",  "lat": 17.4375, "lng": 78.4483, "road_type": "arterial"},
     {"name": "LB Nagar",             "city": "Hyderabad",  "state": "Telangana",  "lat": 17.3490, "lng": 78.5480, "road_type": "arterial"},
     {"name": "Secunderabad",         "city": "Hyderabad",  "state": "Telangana",  "lat": 17.4399, "lng": 78.4983, "road_type": "arterial"},
@@ -110,6 +115,14 @@ INDIA_LOCATIONS: list[dict] = [
 
     # ── Uttarakhand / Himachal ───────────────────────────────────────────────
     {"name": "Rajpur Road Dehradun", "city": "Dehradun",   "state": "Uttarakhand","lat": 30.3165, "lng": 78.0322,"road_type": "arterial"},
+
+    # ── Major airports (for named route optimization) ────────────────────────
+    {"name": "Rajiv Gandhi International Airport", "city": "Hyderabad", "state": "Telangana", "lat": 17.2403, "lng": 78.4294, "road_type": "highway"},
+    {"name": "Kempegowda International Airport",   "city": "Bengaluru", "state": "Karnataka", "lat": 13.1989, "lng": 77.7068, "road_type": "highway"},
+    {"name": "Chhatrapati Shivaji Maharaj International Airport", "city": "Mumbai", "state": "Maharashtra", "lat": 19.0896, "lng": 72.8656, "road_type": "highway"},
+    {"name": "Indira Gandhi International Airport", "city": "New Delhi", "state": "Delhi", "lat": 28.5562, "lng": 77.1000, "road_type": "highway"},
+    {"name": "Chennai International Airport",      "city": "Chennai",   "state": "Tamil Nadu", "lat": 12.9941, "lng": 80.1709, "road_type": "highway"},
+    {"name": "Netaji Subhas Chandra Bose International Airport", "city": "Kolkata", "state": "West Bengal", "lat": 22.6547, "lng": 88.4467, "road_type": "highway"},
 ]
 
 # Quick lookup: location name → metadata

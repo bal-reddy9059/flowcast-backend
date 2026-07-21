@@ -11,6 +11,8 @@ own location string need entries here (e.g. "Gachibowli" never contains
 are named "Ring Road Surat" etc., but are included anyway for explicitness.
 """
 
+import re
+
 from sqlalchemy import or_
 
 CITY_ALIASES: dict[str, list[str]] = {
@@ -165,7 +167,12 @@ def location_filter(model_col, location: str):
 
     Falls back to a plain ilike when the location is not a known city shortcut.
     """
-    aliases = CITY_ALIASES.get(location.lower())
+    normalized = re.sub(
+        r"\s+(urban|rural|district|city)$",
+        "",
+        location.strip().lower(),
+    ).strip()
+    aliases = CITY_ALIASES.get(normalized)
     if aliases:
         return or_(*[model_col.ilike(f"%{a}%") for a in aliases])
     return model_col.ilike(f"%{location}%")
