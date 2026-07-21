@@ -59,7 +59,7 @@ with the generated Vercel production domain and redeploy the backend.
 
 In the Railway backend service Settings:
 
-- Keep the production branch set to `main`.
+- Set the production branch to `dev` (the backend repository's current branch).
 - Enable automatic deployments.
 - Enable "Wait for CI" if GitHub branch checks are configured.
 
