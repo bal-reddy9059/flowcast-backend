@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from fastapi import WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,13 @@ class ConnectionManager:
                 return primary
         return None
 
+    @staticmethod
+    def _is_connected(websocket: WebSocket) -> bool:
+        return (
+            websocket.application_state == WebSocketState.CONNECTED
+            and websocket.client_state != WebSocketState.DISCONNECTED
+        )
+
     async def connect(
         self,
         user_id: str,
@@ -71,24 +79,27 @@ class ConnectionManager:
         """
         Accept and register a new WebSocket connection for a user.
 
-        If the user already has an active connection, the old one is closed
-        before accepting the new connection.
+        The new socket is registered before the old one is closed. This ensures
+        a late disconnect event from the old socket cannot remove the replacement.
         """
         primary = self._normalize(user_id)
+        await websocket.accept()
 
-        if primary in self.active_connections:
-            old_ws = self.active_connections[primary]
-            try:
-                await old_ws.close(code=1000, reason="New connection established")
-            except Exception as error:
-                logger.warning("Failed to close old connection for user %s: %s", primary, error)
+        old_ws = self.active_connections.get(primary)
 
         # Drop stale aliases that pointed at this primary
         self._aliases = {k: v for k, v in self._aliases.items() if v != primary}
 
-        await websocket.accept()
         self.active_connections[primary] = websocket
         self._register_aliases(primary, aliases)
+
+        if old_ws is not None and old_ws is not websocket and self._is_connected(old_ws):
+            try:
+                await old_ws.close(code=1000, reason="New connection established")
+            except (RuntimeError, WebSocketDisconnect):
+                logger.debug("Old WebSocket for user %s was already closed", primary)
+            except Exception as error:
+                logger.warning("Failed to close old connection for user %s: %s", primary, error)
 
         logger.info(
             "User %s connected to WebSocket. Total connections: %s",
@@ -96,11 +107,12 @@ class ConnectionManager:
             len(self.active_connections),
         )
 
-    def disconnect(self, user_id: str) -> None:
-        """Remove a user's WebSocket connection from active connections."""
+    def disconnect(self, user_id: str, websocket: Optional[WebSocket] = None) -> None:
+        """Remove a connection, unless it has already been replaced by a newer socket."""
         primary = self._resolve_key(user_id) or self._normalize(user_id)
+        active = self.active_connections.get(primary)
 
-        if primary in self.active_connections:
+        if active is not None and (websocket is None or active is websocket):
             del self.active_connections[primary]
             self._aliases = {k: v for k, v in self._aliases.items() if v != primary}
             logger.info(
@@ -122,6 +134,9 @@ class ConnectionManager:
             return False
 
         websocket = self.active_connections[target_key]
+        if not self._is_connected(websocket):
+            self.disconnect(target_key, websocket)
+            return False
 
         try:
             await websocket.send_json(message)
@@ -129,37 +144,40 @@ class ConnectionManager:
             return True
         except WebSocketDisconnect:
             logger.warning("WebSocket disconnected while sending to user %s", target_key)
-            self.disconnect(target_key)
+            self.disconnect(target_key, websocket)
             return False
         except RuntimeError as error:
             logger.warning("Runtime error sending to user %s: %s", target_key, error)
-            self.disconnect(target_key)
+            self.disconnect(target_key, websocket)
             return False
         except Exception as error:
             logger.error("Failed to send message to user %s: %s", target_key, error)
-            self.disconnect(target_key)
+            self.disconnect(target_key, websocket)
             return False
 
     async def broadcast(self, message: dict) -> None:
         """Send a message to all connected users."""
-        disconnected_users: List[str] = []
+        disconnected_users: List[tuple[str, WebSocket]] = []
         user_ids = list(self.active_connections.keys())
 
         for uid in user_ids:
             if uid not in self.active_connections:
                 continue
             websocket = self.active_connections[uid]
+            if not self._is_connected(websocket):
+                disconnected_users.append((uid, websocket))
+                continue
             try:
                 await websocket.send_json(message)
             except WebSocketDisconnect:
                 logger.warning("WebSocket disconnected during broadcast for user %s", uid)
-                disconnected_users.append(uid)
+                disconnected_users.append((uid, websocket))
             except Exception as error:
                 logger.error("Failed to send broadcast to user %s: %s", uid, error)
-                disconnected_users.append(uid)
+                disconnected_users.append((uid, websocket))
 
-        for uid in disconnected_users:
-            self.disconnect(uid)
+        for uid, websocket in disconnected_users:
+            self.disconnect(uid, websocket)
 
         logger.info(
             "Broadcast sent to %s users (removed %s dead connections)",
@@ -175,8 +193,17 @@ class ConnectionManager:
         """Get the total number of active WebSocket connections."""
         return len(self.active_connections)
 
-    async def send_ping(self, user_id: str) -> bool:
+    async def send_ping(
+        self,
+        user_id: str,
+        websocket: Optional[WebSocket] = None,
+    ) -> bool:
         """Send a keepalive ping message to a connected user."""
+        target_key = self._resolve_key(user_id)
+        if target_key is None:
+            return False
+        if websocket is not None and self.active_connections.get(target_key) is not websocket:
+            return False
         ping_message = {
             "type": "ping",
             "timestamp": datetime.now(timezone.utc).isoformat(),

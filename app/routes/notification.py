@@ -5,6 +5,7 @@ Provides WebSocket live alerts and REST endpoints for notification management.
 """
 
 import asyncio
+import json
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -449,27 +450,35 @@ async def websocket_notifications_endpoint(websocket: WebSocket, user_id: str) -
                     timeout=WEBSOCKET_KEEPALIVE_INTERVAL,
                 )
 
-                if data == "pong":
+                is_pong = data == "pong"
+                if not is_pong:
+                    try:
+                        is_pong = json.loads(data).get("type") == "pong"
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
+                if is_pong:
                     logger.debug("Received pong from user %s", connect_key)
                     continue
 
             except asyncio.TimeoutError:
-                await manager.send_ping(connect_key)
+                if not await manager.send_ping(connect_key, websocket):
+                    break
                 continue
 
             except WebSocketDisconnect:
-                manager.disconnect(connect_key)
                 logger.info("User %s WebSocket disconnected", connect_key)
                 break
 
             except Exception as error:
                 logger.error("WebSocket error for user %s: %s", connect_key, error)
-                manager.disconnect(connect_key)
                 break
 
+    except WebSocketDisconnect:
+        logger.info("User %s WebSocket disconnected during setup", connect_key)
     except Exception as error:
         logger.error("WebSocket connection failed for user %s: %s", connect_key, error)
-        manager.disconnect(connect_key)
+    finally:
+        manager.disconnect(connect_key, websocket)
 
 
 async def _seed_notifications(user_id: uuid.UUID, db: Session) -> None:
